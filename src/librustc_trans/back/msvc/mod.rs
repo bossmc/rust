@@ -28,212 +28,277 @@
 //! shell or MSYS shells.
 //!
 //! As a high-level note, all logic in this module for looking up various
-//! paths/files is copied over from Clang in its MSVCToolChain.cpp file, but
+//! paths/files is based on Microsoft's logic in their vcvars bat files, but
 //! comments can also be found below leading through the various code paths.
 
-use std::process::Command;
-use session::Session;
+// A simple macro to make this option mess easier to read
+macro_rules! otry {
+    ($expr:expr) => (match $expr {
+        Some(val) => val,
+        None => return None,
+    })
+}
 
 #[cfg(windows)]
 mod registry;
+#[cfg(windows)]
+mod arch;
 
 #[cfg(windows)]
-pub fn link_exe_cmd(sess: &Session) -> Command {
+mod platform {
     use std::env;
     use std::ffi::OsString;
     use std::fs;
-    use std::path::PathBuf;
-    use self::registry::{RegistryKey, LOCAL_MACHINE};
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use session::Session;
+    use super::arch::{host_arch, Arch};
+    use super::registry::LOCAL_MACHINE;
 
-    // When finding the link.exe binary the 32-bit version is at the top level
-    // but the versions to cross to other architectures are stored in
-    // sub-folders. Unknown architectures also just bail out early to return the
-    // standard `link.exe` command.
-    let extra = match &sess.target.target.arch[..] {
-        "x86" => "",
-        "x86_64" => "amd64",
-        "arm" => "arm",
-        _ => return Command::new("link.exe"),
-    };
-
-    let vs_install_dir = get_vs_install_dir();
-
-    // First up, we need to find the `link.exe` binary itself, and there's a few
-    // locations that we can look. First up is the standard VCINSTALLDIR
-    // environment variable which is normally set by the vcvarsall.bat file. If
-    // an environment is set up manually by whomever's driving the compiler then
-    // we shouldn't muck with that decision and should instead respect that.
+    // First we need to figure out whether the environment is already correctly
+    // configured by vcvars. We do this by looking at the environment variable
+    // `VCINSTALLDIR` which is always set by vcvars, and unlikely to be set
+    // otherwise. If it is defined, then we find `link.exe` in `PATH and trust
+    // that everything else is configured correctly.
     //
-    // Next up is looking in PATH itself. Here we look for `cl.exe` and then
-    // assume that `link.exe` is next to it if we find it. Note that we look for
-    // `cl.exe` because MinGW ships /usr/bin/link.exe which is normally found in
-    // PATH but we're not interested in finding that.
+    // If `VCINSTALLDIR` wasn't defined (or we couldn't find the linker where
+    // it claimed it should be), then we resort to finding everything
+    // ourselves. First we find where the latest version of MSVC is installed
+    // and what version it is. Then based on the version we find the
+    // appropriate SDKs.
     //
-    // Finally we read the Windows registry to discover the VS install root.
-    // From here we probe for `link.exe` just to make sure that it exists.
-    let mut cmd = env::var_os("VCINSTALLDIR").and_then(|dir| {
-        let mut p = PathBuf::from(dir);
-        p.push("bin");
-        p.push(extra);
-        p.push("link.exe");
-        if fs::metadata(&p).is_ok() {Some(p)} else {None}
-    }).or_else(|| {
-        env::var_os("PATH").and_then(|path| {
+    // If despite our best efforts we are still unable to find MSVC then we
+    // just blindly call `link.exe` and hope for the best.
+    //
+    // This code only supports VC 11 through 15. For versions older than that
+    // the user will need to manually execute the appropriate vcvars bat file
+    // and it should hopefully work.
+    //
+    // The second member of the tuple we return is the directory for the host
+    // linker toolchain, which is necessary when using the cross linkers.
+    pub fn link_exe_cmd(sess: &Session) -> (Command, Option<PathBuf>) {
+        let arch = &sess.target.target.arch;
+        env::var_os("VCINSTALLDIR").and_then(|_| {
+            debug!("Detected that vcvars was already run.");
+            let path = otry!(env::var_os("PATH"));
+            // Mingw has its own link which is not the link we want so we
+            // look for `cl.exe` too as a precaution.
             env::split_paths(&path).find(|path| {
-                fs::metadata(&path.join("cl.exe")).is_ok()
-            }).map(|p| {
-                p.join("link.exe")
-            })
-        })
-    }).or_else(|| {
-        vs_install_dir.as_ref().and_then(|p| {
-            let mut p = p.join("VC/bin");
-            p.push(extra);
-            p.push("link.exe");
-            if fs::metadata(&p).is_ok() {Some(p)} else {None}
-        })
-    }).map(|linker| {
-        Command::new(linker)
-    }).unwrap_or_else(|| {
-        Command::new("link.exe")
-    });
-
-    // The MSVC linker uses the LIB environment variable as the default lookup
-    // path for libraries. This environment variable is normally set up by the
-    // VS shells, so we only want to start adding our own pieces if it's not
-    // set.
-    //
-    // If we're adding our own pieces, then we need to add two primary
-    // directories to the default search path for the linker. The first is in
-    // the VS install direcotry and the next is the Windows SDK directory.
-    if env::var_os("LIB").is_none() {
-        if let Some(mut vs_install_dir) = vs_install_dir {
-            vs_install_dir.push("VC/lib");
-            vs_install_dir.push(extra);
-            let mut arg = OsString::from("/LIBPATH:");
-            arg.push(&vs_install_dir);
-            cmd.arg(arg);
-        }
-        if let Some(path) = get_windows_sdk_lib_path(sess) {
-            let mut arg = OsString::from("/LIBPATH:");
-            arg.push(&path);
-            cmd.arg(arg);
-        }
-    }
-
-    return cmd;
-
-    // When looking for the Visual Studio installation directory we look in a
-    // number of locations in varying degrees of precedence:
-    //
-    // 1. The Visual Studio registry keys
-    // 2. The Visual Studio Express registry keys
-    // 3. A number of somewhat standard environment variables
-    //
-    // If we find a hit from any of these keys then we strip off the IDE/Tools
-    // folders which are typically found at the end.
-    //
-    // As a final note, when we take a look at the registry keys they're
-    // typically found underneath the version of what's installed, but we don't
-    // quite know what's installed. As a result we probe all sub-keys of the two
-    // keys we're looking at to find out the maximum version of what's installed
-    // and we use that root directory.
-    fn get_vs_install_dir() -> Option<PathBuf> {
-        LOCAL_MACHINE.open(r"SOFTWARE\Microsoft\VisualStudio".as_ref()).or_else(|_| {
-            LOCAL_MACHINE.open(r"SOFTWARE\Microsoft\VCExpress".as_ref())
-        }).ok().and_then(|key| {
-            max_version(&key).and_then(|(_vers, key)| {
-                key.query_str("InstallDir").ok()
-            })
-        }).or_else(|| {
-            env::var_os("VS120COMNTOOLS")
-        }).or_else(|| {
-            env::var_os("VS100COMNTOOLS")
-        }).or_else(|| {
-            env::var_os("VS90COMNTOOLS")
-        }).or_else(|| {
-            env::var_os("VS80COMNTOOLS")
-        }).map(PathBuf::from).and_then(|mut dir| {
-            if dir.ends_with("Common7/IDE") || dir.ends_with("Common7/Tools") {
-                dir.pop();
-                dir.pop();
-                Some(dir)
-            } else {
-                None
-            }
-        })
-    }
-
-    // Given a registry key, look at all the sub keys and find the one which has
-    // the maximal numeric value.
-    //
-    // Returns the name of the maximal key as well as the opened maximal key.
-    fn max_version(key: &RegistryKey) -> Option<(OsString, RegistryKey)> {
-        let mut max_vers = 0;
-        let mut max_key = None;
-        for subkey in key.iter().filter_map(|k| k.ok()) {
-            let val = subkey.to_str().and_then(|s| {
-                s.trim_left_matches("v").replace(".", "").parse().ok()
-            });
-            let val = match val {
-                Some(s) => s,
-                None => continue,
-            };
-            if val > max_vers {
-                if let Ok(k) = key.open(&subkey) {
-                    max_vers = val;
-                    max_key = Some((subkey, k));
-                }
-            }
-        }
-        return max_key
-    }
-
-    fn get_windows_sdk_lib_path(sess: &Session) -> Option<PathBuf> {
-        let key = r"SOFTWARE\Microsoft\Microsoft SDKs\Windows";
-        let key = LOCAL_MACHINE.open(key.as_ref());
-        let (n, k) = match key.ok().as_ref().and_then(max_version) {
-            Some(p) => p,
-            None => return None,
-        };
-        let mut parts = n.to_str().unwrap().trim_left_matches("v").splitn(2, ".");
-        let major = parts.next().unwrap().parse::<usize>().unwrap();
-        let _minor = parts.next().unwrap().parse::<usize>().unwrap();
-        let path = match k.query_str("InstallationFolder") {
-            Ok(p) => PathBuf::from(p).join("Lib"),
-            Err(..) => return None,
-        };
-        if major <= 7 {
-            // In Windows SDK 7.x, x86 libraries are directly in the Lib folder,
-            // x64 libraries are inside, and it's not necessary to link agains
-            // the SDK 7.x when targeting ARM or other architectures.
-            let x86 = match &sess.target.target.arch[..] {
-                "x86" => true,
-                "x86_64" => false,
-                _ => return None,
-            };
-            Some(if x86 {path} else {path.join("x64")})
-        } else {
-            // Windows SDK 8.x installes libraries in a folder whose names
-            // depend on the version of the OS you're targeting. By default
-            // choose the newest, which usually corresponds to the version of
-            // the OS you've installed the SDK on.
-            let extra = match &sess.target.target.arch[..] {
-                "x86" => "x86",
-                "x86_64" => "x64",
-                "arm" => "arm",
-                _ => return None,
-            };
-            ["winv6.3", "win8", "win7"].iter().map(|p| path.join(p)).find(|part| {
-                fs::metadata(part).is_ok()
+                path.join("cl.exe").is_file()
+                    && path.join("link.exe").is_file()
             }).map(|path| {
-                path.join("um").join(extra)
+                (Command::new(path.join("link.exe")), None)
             })
+        }).or_else(|| {
+            None.or_else(|| {
+                find_msvc_latest(arch, "15.0")
+            }).or_else(|| {
+                find_msvc_latest(arch, "14.0")
+            }).or_else(|| {
+                find_msvc_12(arch)
+            }).or_else(|| {
+                find_msvc_11(arch)
+            }).map(|(cmd, path)| (cmd, Some(path)))
+        }).unwrap_or_else(|| {
+            debug!("Failed to locate linker.");
+            (Command::new("link.exe"), None)
+        })
+    }
+
+    // For MSVC 14 or newer we need to find the Universal CRT as well as either
+    // the Windows 10 SDK or Windows 8.1 SDK.
+    fn find_msvc_latest(arch: &str, ver: &str) -> Option<(Command, PathBuf)> {
+        let vcdir = otry!(get_vc_dir(ver));
+        let (mut cmd, host) = otry!(get_linker(&vcdir, arch));
+        let sub = otry!(lib_subdir(arch));
+        let ucrt = otry!(get_ucrt_dir());
+        debug!("Found Universal CRT {:?}", ucrt);
+        add_lib(&mut cmd, &ucrt.join("ucrt").join(sub));
+        if let Some(dir) = get_sdk10_dir() {
+            debug!("Found Win10 SDK {:?}", dir);
+            add_lib(&mut cmd, &dir.join("um").join(sub));
+        } else if let Some(dir) = get_sdk81_dir() {
+            debug!("Found Win8.1 SDK {:?}", dir);
+            add_lib(&mut cmd, &dir.join("um").join(sub));
+        } else {
+            return None
+        }
+        Some((cmd, host))
+    }
+
+    // For MSVC 12 we need to find the Windows 8.1 SDK.
+    fn find_msvc_12(arch: &str) -> Option<(Command, PathBuf)> {
+        let vcdir = otry!(get_vc_dir("12.0"));
+        let (mut cmd, host) = otry!(get_linker(&vcdir, arch));
+        let sub = otry!(lib_subdir(arch));
+        let sdk81 = otry!(get_sdk81_dir());
+        debug!("Found Win8.1 SDK {:?}", sdk81);
+        add_lib(&mut cmd, &sdk81.join("um").join(sub));
+        Some((cmd, host))
+    }
+
+    // For MSVC 11 we need to find the Windows 8 SDK.
+    fn find_msvc_11(arch: &str) -> Option<(Command, PathBuf)> {
+        let vcdir = otry!(get_vc_dir("11.0"));
+        let (mut cmd, host) = otry!(get_linker(&vcdir, arch));
+        let sub = otry!(lib_subdir(arch));
+        let sdk8 = otry!(get_sdk8_dir());
+        debug!("Found Win8 SDK {:?}", sdk8);
+        add_lib(&mut cmd, &sdk8.join("um").join(sub));
+        Some((cmd, host))
+    }
+
+    // A convenience function to append library paths.
+    fn add_lib(cmd: &mut Command, lib: &Path) {
+        let mut arg: OsString = "/LIBPATH:".into();
+        arg.push(lib);
+        cmd.arg(arg);
+    }
+
+    // Given a possible MSVC installation directory, we look for the linker and
+    // then add the MSVC library path.
+    fn get_linker(path: &Path, arch: &str) -> Option<(Command, PathBuf)> {
+        debug!("Looking for linker in {:?}", path);
+        bin_subdir(arch).into_iter().map(|(sub, host)| {
+            (path.join("bin").join(sub).join("link.exe"),
+             path.join("bin").join(host))
+        }).filter(|&(ref path, _)| {
+            path.is_file()
+        }).map(|(path, host)| {
+            (Command::new(path), host)
+        }).filter_map(|(mut cmd, host)| {
+            let sub = otry!(vc_lib_subdir(arch));
+            add_lib(&mut cmd, &path.join("lib").join(sub));
+            Some((cmd, host))
+        }).next()
+    }
+
+    // To find MSVC we look in a specific registry key for the version we are
+    // trying to find.
+    fn get_vc_dir(ver: &str) -> Option<PathBuf> {
+        let key = otry!(LOCAL_MACHINE
+            .open(r"SOFTWARE\Microsoft\VisualStudio\SxS\VC7".as_ref()).ok());
+        let path = otry!(key.query_str(ver).ok());
+        Some(path.into())
+    }
+
+    // To find the Universal CRT we look in a specific registry key for where
+    // all the Universal CRTs are located and then sort them asciibetically to
+    // find the newest version. While this sort of sorting isn't ideal,  it is
+    // what vcvars does so that's good enough for us.
+    fn get_ucrt_dir() -> Option<PathBuf> {
+        let key = otry!(LOCAL_MACHINE
+            .open(r"SOFTWARE\Microsoft\Windows Kits\Installed Roots".as_ref()).ok());
+        let root = otry!(key.query_str("KitsRoot10").ok());
+        let readdir = otry!(fs::read_dir(Path::new(&root).join("lib")).ok());
+        readdir.filter_map(|dir| {
+            dir.ok()
+        }).map(|dir| {
+            dir.path()
+        }).filter(|dir| {
+            dir.components().last().and_then(|c| {
+                c.as_os_str().to_str()
+            }).map(|c| {
+                c.starts_with("10.") && dir.join("ucrt").is_dir()
+            }).unwrap_or(false)
+        }).max()
+    }
+
+    // Vcvars finds the correct version of the Windows 10 SDK by looking
+    // for the include `um\Windows.h` because sometimes a given version will
+    // only have UCRT bits without the rest of the SDK. Since we only care about
+    // libraries and not includes, we instead look for `um\x64\kernel32.lib`.
+    // Since the 32-bit and 64-bit libraries are always installed together we
+    // only need to bother checking x64, making this code a tiny bit simpler.
+    // Like we do for the Universal CRT, we sort the possibilities
+    // asciibetically to find the newest one as that is what vcvars does.
+    fn get_sdk10_dir() -> Option<PathBuf> {
+        let key = otry!(LOCAL_MACHINE
+            .open(r"SOFTWARE\Microsoft\Microsoft SDKs\Windows\v10.0".as_ref()).ok());
+        let root = otry!(key.query_str("InstallationFolder").ok());
+        let readdir = otry!(fs::read_dir(Path::new(&root).join("lib")).ok());
+        let mut dirs: Vec<_> = readdir.filter_map(|dir| dir.ok())
+            .map(|dir| dir.path()).collect();
+        dirs.sort();
+        dirs.into_iter().rev().filter(|dir| {
+            dir.join("um").join("x64").join("kernel32.lib").is_file()
+        }).next()
+    }
+
+    // Interestingly there are several subdirectories, `win7` `win8` and
+    // `winv6.3`. Vcvars seems to only care about `winv6.3` though, so the same
+    // applies to us. Note that if we were targetting kernel mode drivers
+    // instead of user mode applications, we would care.
+    fn get_sdk81_dir() -> Option<PathBuf> {
+        let key = otry!(LOCAL_MACHINE
+            .open(r"SOFTWARE\Microsoft\Microsoft SDKs\Windows\v8.1".as_ref()).ok());
+        let root = otry!(key.query_str("InstallationFolder").ok());
+        Some(Path::new(&root).join("lib").join("winv6.3"))
+    }
+
+    fn get_sdk8_dir() -> Option<PathBuf> {
+        let key = otry!(LOCAL_MACHINE
+            .open(r"SOFTWARE\Microsoft\Microsoft SDKs\Windows\v8.0".as_ref()).ok());
+        let root = otry!(key.query_str("InstallationFolder").ok());
+        Some(Path::new(&root).join("lib").join("win8"))
+    }
+
+    // When choosing the linker toolchain to use, we have to choose the one
+    // which matches the host architecture. Otherwise we end up in situations
+    // where someone on 32-bit Windows is trying to cross compile to 64-bit and
+    // it tries to invoke the native 64-bit linker which won't work.
+    //
+    // For the return value of this function, the first member of the tuple is
+    // the folder of the linker we will be invoking, while the second member
+    // is the folder of the host toolchain for that linker which is essential
+    // when using a cross linker. We return a Vec since on x64 there are often
+    // two linkers that can target the architecture we desire. The 64-bit host
+    // linker is preferred, and hence first, due to 64-bit allowing it more
+    // address space to work with and potentially being faster.
+    //
+    // FIXME - Figure out what happens when the host architecture is arm.
+    fn bin_subdir(arch: &str) -> Vec<(&'static str, &'static str)> {
+        match (arch, host_arch()) {
+            ("x86", Some(Arch::X86)) => vec![("", "")],
+            ("x86", Some(Arch::Amd64)) => vec![("amd64_x86", "amd64"), ("", "")],
+            ("x86_64", Some(Arch::X86)) => vec![("x86_amd64", "")],
+            ("x86_64", Some(Arch::Amd64)) => vec![("amd64", "amd64"), ("x86_amd64", "")],
+            ("arm", Some(Arch::X86)) => vec![("x86_arm", "")],
+            ("arm", Some(Arch::Amd64)) => vec![("amd64_arm", "amd64"), ("x86_arm", "")],
+            _ => vec![],
+        }
+    }
+
+    fn lib_subdir(arch: &str) -> Option<&'static str> {
+        match arch {
+            "x86" => Some("x86"),
+            "x86_64" => Some("x64"),
+            "arm" => Some("arm"),
+            _ => None,
+        }
+    }
+
+    // MSVC's x86 libraries are not in a subfolder
+    fn vc_lib_subdir(arch: &str) -> Option<&'static str> {
+        match arch {
+            "x86" => Some(""),
+            "x86_64" => Some("amd64"),
+            "arm" => Some("arm"),
+            _ => None,
         }
     }
 }
 
+// If we're not on Windows, then there's no registry to search through and MSVC
+// wouldn't be able to run, so we just call `link.exe` and hope for the best.
 #[cfg(not(windows))]
-pub fn link_exe_cmd(_sess: &Session) -> Command {
-    Command::new("link.exe")
+mod platform {
+    use std::path::PathBuf;
+    use std::process::Command;
+    use session::Session;
+    pub fn link_exe_cmd(_sess: &Session) -> (Command, Option<PathBuf>) {
+        (Command::new("link.exe"), None)
+    }
 }
+
+pub use self::platform::*;

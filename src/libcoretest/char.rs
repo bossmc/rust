@@ -8,6 +8,8 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
+use std::char;
+
 #[test]
 fn test_is_lowercase() {
     assert!('a'.is_lowercase());
@@ -55,28 +57,24 @@ fn test_to_digit() {
 
 #[test]
 fn test_to_lowercase() {
-    fn lower(c: char) -> char {
-        let mut it = c.to_lowercase();
-        let c = it.next().unwrap();
-        // As of Unicode version 7.0.0, `SpecialCasing.txt` has no lower-case mapping
-        // to multiple code points.
-        assert!(it.next().is_none());
-        c
+    fn lower(c: char) -> Vec<char> {
+        c.to_lowercase().collect()
     }
-    assert_eq!(lower('A'), 'a');
-    assert_eq!(lower('Ö'), 'ö');
-    assert_eq!(lower('ß'), 'ß');
-    assert_eq!(lower('Ü'), 'ü');
-    assert_eq!(lower('💩'), '💩');
-    assert_eq!(lower('Σ'), 'σ');
-    assert_eq!(lower('Τ'), 'τ');
-    assert_eq!(lower('Ι'), 'ι');
-    assert_eq!(lower('Γ'), 'γ');
-    assert_eq!(lower('Μ'), 'μ');
-    assert_eq!(lower('Α'), 'α');
-    assert_eq!(lower('Σ'), 'σ');
-    assert_eq!(lower('ǅ'), 'ǆ');
-    assert_eq!(lower('ﬁ'), 'ﬁ');
+    assert_eq!(lower('A'), ['a']);
+    assert_eq!(lower('Ö'), ['ö']);
+    assert_eq!(lower('ß'), ['ß']);
+    assert_eq!(lower('Ü'), ['ü']);
+    assert_eq!(lower('💩'), ['💩']);
+    assert_eq!(lower('Σ'), ['σ']);
+    assert_eq!(lower('Τ'), ['τ']);
+    assert_eq!(lower('Ι'), ['ι']);
+    assert_eq!(lower('Γ'), ['γ']);
+    assert_eq!(lower('Μ'), ['μ']);
+    assert_eq!(lower('Α'), ['α']);
+    assert_eq!(lower('Σ'), ['σ']);
+    assert_eq!(lower('ǅ'), ['ǆ']);
+    assert_eq!(lower('ﬁ'), ['ﬁ']);
+    assert_eq!(lower('İ'), ['i', '\u{307}']);
 }
 
 #[test]
@@ -126,6 +124,49 @@ fn test_is_digit() {
 }
 
 #[test]
+fn test_escape_debug() {
+    fn string(c: char) -> String {
+        c.escape_debug().collect()
+    }
+    let s = string('\n');
+    assert_eq!(s, "\\n");
+    let s = string('\r');
+    assert_eq!(s, "\\r");
+    let s = string('\'');
+    assert_eq!(s, "\\'");
+    let s = string('"');
+    assert_eq!(s, "\\\"");
+    let s = string(' ');
+    assert_eq!(s, " ");
+    let s = string('a');
+    assert_eq!(s, "a");
+    let s = string('~');
+    assert_eq!(s, "~");
+    let s = string('é');
+    assert_eq!(s, "é");
+    let s = string('\x00');
+    assert_eq!(s, "\\u{0}");
+    let s = string('\x1f');
+    assert_eq!(s, "\\u{1f}");
+    let s = string('\x7f');
+    assert_eq!(s, "\\u{7f}");
+    let s = string('\u{80}');
+    assert_eq!(s, "\\u{80}");
+    let s = string('\u{ff}');
+    assert_eq!(s, "\u{ff}");
+    let s = string('\u{11b}');
+    assert_eq!(s, "\u{11b}");
+    let s = string('\u{1d4b6}');
+    assert_eq!(s, "\u{1d4b6}");
+    let s = string('\u{200b}'); // zero width space
+    assert_eq!(s, "\\u{200b}");
+    let s = string('\u{e000}'); // private use 1
+    assert_eq!(s, "\\u{e000}");
+    let s = string('\u{100000}'); // private use 2
+    assert_eq!(s, "\\u{100000}");
+}
+
+#[test]
 fn test_escape_default() {
     fn string(c: char) -> String {
         c.escape_default().collect()
@@ -144,18 +185,28 @@ fn test_escape_default() {
     assert_eq!(s, "a");
     let s = string('~');
     assert_eq!(s, "~");
+    let s = string('é');
+    assert_eq!(s, "\\u{e9}");
     let s = string('\x00');
     assert_eq!(s, "\\u{0}");
     let s = string('\x1f');
     assert_eq!(s, "\\u{1f}");
     let s = string('\x7f');
     assert_eq!(s, "\\u{7f}");
+    let s = string('\u{80}');
+    assert_eq!(s, "\\u{80}");
     let s = string('\u{ff}');
     assert_eq!(s, "\\u{ff}");
     let s = string('\u{11b}');
     assert_eq!(s, "\\u{11b}");
     let s = string('\u{1d4b6}');
     assert_eq!(s, "\\u{1d4b6}");
+    let s = string('\u{200b}'); // zero width space
+    assert_eq!(s, "\\u{200b}");
+    let s = string('\u{e000}'); // private use 1
+    assert_eq!(s, "\\u{e000}");
+    let s = string('\u{100000}'); // private use 2
+    assert_eq!(s, "\\u{100000}");
 }
 
 #[test]
@@ -179,9 +230,10 @@ fn test_escape_unicode() {
 #[test]
 fn test_encode_utf8() {
     fn check(input: char, expect: &[u8]) {
-        let mut buf = [0; 4];
-        let n = input.encode_utf8(&mut buf).unwrap_or(0);
-        assert_eq!(&buf[..n], expect);
+        assert_eq!(input.encode_utf8().as_slice(), expect);
+        for (a, b) in input.encode_utf8().zip(expect) {
+            assert_eq!(a, *b);
+        }
     }
 
     check('x', &[0x78]);
@@ -193,9 +245,10 @@ fn test_encode_utf8() {
 #[test]
 fn test_encode_utf16() {
     fn check(input: char, expect: &[u16]) {
-        let mut buf = [0; 2];
-        let n = input.encode_utf16(&mut buf).unwrap_or(0);
-        assert_eq!(&buf[..n], expect);
+        assert_eq!(input.encode_utf16().as_slice(), expect);
+        for (a, b) in input.encode_utf16().zip(expect) {
+            assert_eq!(a, *b);
+        }
     }
 
     check('x', &[0x0078]);
@@ -212,30 +265,122 @@ fn test_len_utf16() {
     assert!('\u{1f4a9}'.len_utf16() == 2);
 }
 
-#[allow(deprecated)]
 #[test]
-fn test_width() {
-    assert_eq!('\x00'.width(false),Some(0));
-    assert_eq!('\x00'.width(true),Some(0));
+fn test_decode_utf16() {
+    fn check(s: &[u16], expected: &[Result<char, u16>]) {
+        let v = char::decode_utf16(s.iter().cloned())
+                     .map(|r| r.map_err(|e| e.unpaired_surrogate()))
+                     .collect::<Vec<_>>();
+        assert_eq!(v, expected);
+    }
+    check(&[0xD800, 0x41, 0x42], &[Err(0xD800), Ok('A'), Ok('B')]);
+    check(&[0xD800, 0], &[Err(0xD800), Ok('\0')]);
+}
 
-    assert_eq!('\x0A'.width(false),None);
-    assert_eq!('\x0A'.width(true),None);
+#[test]
+fn ed_iterator_specializations() {
+    // Check counting
+    assert_eq!('\n'.escape_default().count(), 2);
+    assert_eq!('c'.escape_default().count(), 1);
+    assert_eq!(' '.escape_default().count(), 1);
+    assert_eq!('\\'.escape_default().count(), 2);
+    assert_eq!('\''.escape_default().count(), 2);
 
-    assert_eq!('w'.width(false),Some(1));
-    assert_eq!('w'.width(true),Some(1));
+    // Check nth
 
-    assert_eq!('ｈ'.width(false),Some(2));
-    assert_eq!('ｈ'.width(true),Some(2));
+    // Check that OoB is handled correctly
+    assert_eq!('\n'.escape_default().nth(2), None);
+    assert_eq!('c'.escape_default().nth(1), None);
+    assert_eq!(' '.escape_default().nth(1), None);
+    assert_eq!('\\'.escape_default().nth(2), None);
+    assert_eq!('\''.escape_default().nth(2), None);
 
-    assert_eq!('\u{AD}'.width(false),Some(1));
-    assert_eq!('\u{AD}'.width(true),Some(1));
+    // Check the first char
+    assert_eq!('\n'.escape_default().nth(0), Some('\\'));
+    assert_eq!('c'.escape_default().nth(0), Some('c'));
+    assert_eq!(' '.escape_default().nth(0), Some(' '));
+    assert_eq!('\\'.escape_default().nth(0), Some('\\'));
+    assert_eq!('\''.escape_default().nth(0), Some('\\'));
 
-    assert_eq!('\u{1160}'.width(false),Some(0));
-    assert_eq!('\u{1160}'.width(true),Some(0));
+    // Check the second char
+    assert_eq!('\n'.escape_default().nth(1), Some('n'));
+    assert_eq!('\\'.escape_default().nth(1), Some('\\'));
+    assert_eq!('\''.escape_default().nth(1), Some('\''));
 
-    assert_eq!('\u{a1}'.width(false),Some(1));
-    assert_eq!('\u{a1}'.width(true),Some(2));
+    // Check the last char
+    assert_eq!('\n'.escape_default().last(), Some('n'));
+    assert_eq!('c'.escape_default().last(), Some('c'));
+    assert_eq!(' '.escape_default().last(), Some(' '));
+    assert_eq!('\\'.escape_default().last(), Some('\\'));
+    assert_eq!('\''.escape_default().last(), Some('\''));
+}
 
-    assert_eq!('\u{300}'.width(false),Some(0));
-    assert_eq!('\u{300}'.width(true),Some(0));
+#[test]
+fn eu_iterator_specializations() {
+    fn check(c: char) {
+        let len = c.escape_unicode().count();
+
+        // Check OoB
+        assert_eq!(c.escape_unicode().nth(len), None);
+
+        // For all possible in-bound offsets
+        let mut iter = c.escape_unicode();
+        for offset in 0..len {
+            // Check last
+            assert_eq!(iter.clone().last(), Some('}'));
+
+            // Check len
+            assert_eq!(iter.len(), len - offset);
+
+            // Check size_hint (= len in ExactSizeIterator)
+            assert_eq!(iter.size_hint(), (iter.len(), Some(iter.len())));
+
+            // Check counting
+            assert_eq!(iter.clone().count(), len - offset);
+
+            // Check nth
+            assert_eq!(c.escape_unicode().nth(offset), iter.next());
+        }
+
+        // Check post-last
+        assert_eq!(iter.clone().last(), None);
+        assert_eq!(iter.clone().count(), 0);
+    }
+
+    check('\u{0}');
+    check('\u{1}');
+    check('\u{12}');
+    check('\u{123}');
+    check('\u{1234}');
+    check('\u{12340}');
+    check('\u{10FFFF}');
+}
+
+#[test]
+fn test_decode_utf8() {
+    use core::char::*;
+    use core::iter::FromIterator;
+
+    for &(str, bs) in [("", &[] as &[u8]),
+                       ("A", &[0x41u8] as &[u8]),
+                       ("�", &[0xC1u8, 0x81u8] as &[u8]),
+                       ("♥", &[0xE2u8, 0x99u8, 0xA5u8]),
+                       ("♥A", &[0xE2u8, 0x99u8, 0xA5u8, 0x41u8] as &[u8]),
+                       ("�", &[0xE2u8, 0x99u8] as &[u8]),
+                       ("�A", &[0xE2u8, 0x99u8, 0x41u8] as &[u8]),
+                       ("�", &[0xC0u8] as &[u8]),
+                       ("�A", &[0xC0u8, 0x41u8] as &[u8]),
+                       ("�", &[0x80u8] as &[u8]),
+                       ("�A", &[0x80u8, 0x41u8] as &[u8]),
+                       ("�", &[0xFEu8] as &[u8]),
+                       ("�A", &[0xFEu8, 0x41u8] as &[u8]),
+                       ("�", &[0xFFu8] as &[u8]),
+                       ("�A", &[0xFFu8, 0x41u8] as &[u8])].into_iter() {
+        assert!(Iterator::eq(str.chars(),
+                             decode_utf8(bs.into_iter().map(|&b|b))
+                                 .map(|r_b| r_b.unwrap_or('\u{FFFD}'))),
+                "chars = {}, bytes = {:?}, decoded = {:?}", str, bs,
+                Vec::from_iter(decode_utf8(bs.into_iter().map(|&b|b))
+                                   .map(|r_b| r_b.unwrap_or('\u{FFFD}'))));
+    }
 }

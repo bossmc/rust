@@ -8,12 +8,14 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
+use rustc::hir::def_id::DefId;
+use rustc::ty;
+use rustc::ty::subst::Substs;
 
-use middle::ty;
-use middle::ty_fold;
+use astconv::AstConv;
 
 use std::cell::Cell;
-use syntax::codemap::Span;
+use syntax_pos::Span;
 
 #[derive(Clone)]
 pub struct ElisionFailureInfo {
@@ -51,6 +53,80 @@ pub trait RegionScope {
     /// computing `object_lifetime_default` (in particular, in legacy
     /// modes, it may not be relevant).
     fn base_object_lifetime_default(&self, span: Span) -> ty::Region;
+
+    /// If this scope allows anonymized types, return the generics in
+    /// scope, that anonymized types will close over. For example,
+    /// if you have a function like:
+    ///
+    ///     fn foo<'a, T>() -> impl Trait { ... }
+    ///
+    /// then, for the rscope that is used when handling the return type,
+    /// `anon_type_scope()` would return a `Some(AnonTypeScope {...})`,
+    /// on which `.fresh_substs(...)` can be used to obtain identity
+    /// Substs for `'a` and `T`, to track them in `TyAnon`. This property
+    /// is controlled by the region scope because it's fine-grained enough
+    /// to allow restriction of anonymized types to the syntactical extent
+    /// of a function's return type.
+    fn anon_type_scope(&self) -> Option<AnonTypeScope> {
+        None
+    }
+}
+
+#[derive(Copy, Clone)]
+pub struct AnonTypeScope {
+    enclosing_item: DefId
+}
+
+impl<'gcx: 'tcx, 'tcx> AnonTypeScope {
+    pub fn new(enclosing_item: DefId) -> AnonTypeScope {
+        AnonTypeScope {
+            enclosing_item: enclosing_item
+        }
+    }
+
+    pub fn fresh_substs(&self, astconv: &AstConv<'gcx, 'tcx>, span: Span)
+                        -> &'tcx Substs<'tcx> {
+        use collect::mk_item_substs;
+
+        mk_item_substs(astconv, span, self.enclosing_item)
+    }
+}
+
+/// A scope wrapper which optionally allows anonymized types.
+#[derive(Copy, Clone)]
+pub struct MaybeWithAnonTypes<R> {
+    base_scope: R,
+    anon_scope: Option<AnonTypeScope>
+}
+
+impl<R: RegionScope> MaybeWithAnonTypes<R>  {
+    pub fn new(base_scope: R, anon_scope: Option<AnonTypeScope>) -> Self {
+        MaybeWithAnonTypes {
+            base_scope: base_scope,
+            anon_scope: anon_scope
+        }
+    }
+}
+
+impl<R: RegionScope> RegionScope for MaybeWithAnonTypes<R> {
+    fn object_lifetime_default(&self, span: Span) -> Option<ty::Region> {
+        self.base_scope.object_lifetime_default(span)
+    }
+
+    fn anon_regions(&self,
+                    span: Span,
+                    count: usize)
+                    -> Result<Vec<ty::Region>, Option<Vec<ElisionFailureInfo>>> {
+        self.base_scope.anon_regions(span, count)
+    }
+
+    fn base_object_lifetime_default(&self, span: Span) -> ty::Region {
+        self.base_scope.base_object_lifetime_default(span)
+    }
+
+    fn anon_type_scope(&self) -> Option<AnonTypeScope> {
+        self.anon_scope
+    }
 }
 
 // A scope in which all regions must be explicitly named. This is used
@@ -222,6 +298,10 @@ impl<'r> RegionScope for ObjectLifetimeDefaultRscope<'r> {
     {
         self.base_scope.anon_regions(span, count)
     }
+
+    fn anon_type_scope(&self) -> Option<AnonTypeScope> {
+        self.base_scope.anon_type_scope()
+    }
 }
 
 /// A scope which simply shifts the Debruijn index of other scopes
@@ -239,11 +319,11 @@ impl<'r> ShiftedRscope<'r> {
 impl<'r> RegionScope for ShiftedRscope<'r> {
     fn object_lifetime_default(&self, span: Span) -> Option<ty::Region> {
         self.base_scope.object_lifetime_default(span)
-            .map(|r| ty_fold::shift_region(r, 1))
+            .map(|r| ty::fold::shift_region(r, 1))
     }
 
     fn base_object_lifetime_default(&self, span: Span) -> ty::Region {
-        ty_fold::shift_region(self.base_scope.base_object_lifetime_default(span), 1)
+        ty::fold::shift_region(self.base_scope.base_object_lifetime_default(span), 1)
     }
 
     fn anon_regions(&self,
@@ -254,7 +334,7 @@ impl<'r> RegionScope for ShiftedRscope<'r> {
         match self.base_scope.anon_regions(span, count) {
             Ok(mut v) => {
                 for r in &mut v {
-                    *r = ty_fold::shift_region(*r, 1);
+                    *r = ty::fold::shift_region(*r, 1);
                 }
                 Ok(v)
             }
@@ -262,5 +342,9 @@ impl<'r> RegionScope for ShiftedRscope<'r> {
                 Err(errs)
             }
         }
+    }
+
+    fn anon_type_scope(&self) -> Option<AnonTypeScope> {
+        self.base_scope.anon_type_scope()
     }
 }

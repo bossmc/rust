@@ -8,7 +8,7 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-// Test that we report an error if the trait ref in an qualified type
+// Test that we report an error if the trait ref in a qualified type
 // uses invalid type arguments.
 
 trait Foo<T> {
@@ -18,7 +18,7 @@ trait Foo<T> {
 
 fn f<T:Foo<isize>>(t: &T) {
     let u: <T as Foo<usize>>::Bar = t.get_bar();
-    //~^ ERROR the trait `Foo<usize>` is not implemented for the type `T`
+    //~^ ERROR the trait bound `T: Foo<usize>` is not satisfied
 }
 
 fn main() { }

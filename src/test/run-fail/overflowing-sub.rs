@@ -8,12 +8,11 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-// error-pattern:thread '<main>' panicked at 'arithmetic operation overflowed'
+// ignore-pretty : (#23623) problems when  ending with // comments
+
+// error-pattern:thread 'main' panicked at 'attempt to subtract with overflow'
 // compile-flags: -C debug-assertions
 
-// (Work around constant-evaluation)
-fn value() -> u8 { 42 }
-
 fn main() {
-    let _x = value() - (value() + 1);
+    let _x = 42u8 - (42u8 + 1);
 }

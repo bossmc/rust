@@ -27,31 +27,46 @@ endif
 
 define DEF_LLVM_RULES
 
+ifeq ($(1),$$(CFG_BUILD))
+LLVM_DEPS_TARGET_$(1) := $$(LLVM_DEPS)
+else
+LLVM_DEPS_TARGET_$(1) := $$(LLVM_DEPS) $$(LLVM_CONFIG_$$(CFG_BUILD))
+endif
+
 # If CFG_LLVM_ROOT is defined then we don't build LLVM ourselves
 ifeq ($(CFG_LLVM_ROOT),)
 
 LLVM_STAMP_$(1) = $$(CFG_LLVM_BUILD_DIR_$(1))/llvm-auto-clean-stamp
+LLVM_DONE_$(1) = $$(CFG_LLVM_BUILD_DIR_$(1))/llvm-finished-building
 
-ifeq ($$(findstring msvc,$(1)),msvc)
+$$(LLVM_CONFIG_$(1)): $$(LLVM_DONE_$(1))
 
-$$(LLVM_CONFIG_$(1)): $$(LLVM_DEPS) $$(LLVM_STAMP_$(1))
+$$(LLVM_DONE_$(1)): $$(LLVM_DEPS_TARGET_$(1)) $$(LLVM_STAMP_$(1))
 	@$$(call E, cmake: llvm)
+ifneq ($$(CFG_NINJA),)
+	$$(Q)$$(CFG_NINJA) -C $$(CFG_LLVM_BUILD_DIR_$(1))
+else ifeq ($$(findstring msvc,$(1)),msvc)
 	$$(Q)$$(CFG_CMAKE) --build $$(CFG_LLVM_BUILD_DIR_$(1)) \
 		--config $$(LLVM_BUILD_CONFIG_MODE)
-	$$(Q)touch $$(LLVM_CONFIG_$(1))
-
-clean-llvm$(1):
-
 else
+	$$(Q)$$(MAKE) -C $$(CFG_LLVM_BUILD_DIR_$(1))
+endif
+	$$(Q)touch $$@
 
-$$(LLVM_CONFIG_$(1)): $$(LLVM_DEPS) $$(LLVM_STAMP_$(1))
-	@$$(call E, make: llvm)
-	$$(Q)$$(MAKE) -C $$(CFG_LLVM_BUILD_DIR_$(1)) $$(CFG_LLVM_BUILD_ENV_$(1)) ONLY_TOOLS="$$(LLVM_TOOLS)"
-	$$(Q)touch $$(LLVM_CONFIG_$(1))
-
+ifneq ($$(CFG_NINJA),)
 clean-llvm$(1):
+	@$$(call E, clean: llvm)
+	$$(Q)$$(CFG_NINJA) -C $$(CFG_LLVM_BUILD_DIR_$(1)) -t clean
+else ifeq ($$(findstring msvc,$(1)),msvc)
+clean-llvm$(1):
+	@$$(call E, clean: llvm)
+	$$(Q)$$(CFG_CMAKE) --build $$(CFG_LLVM_BUILD_DIR_$(1)) \
+		--config $$(LLVM_BUILD_CONFIG_MODE) \
+		--target clean
+else
+clean-llvm$(1):
+	@$$(call E, clean: llvm)
 	$$(Q)$$(MAKE) -C $$(CFG_LLVM_BUILD_DIR_$(1)) clean
-
 endif
 
 else
@@ -64,26 +79,32 @@ $$(LLVM_AR_$(1)): $$(LLVM_CONFIG_$(1))
 # when we changed something not otherwise captured by builtin
 # dependencies. In these cases, commit a change that touches
 # the stamp in the source dir.
-$$(LLVM_STAMP_$(1)): $(S)src/rustllvm/llvm-auto-clean-trigger
+$$(LLVM_STAMP_$(1)): $$(S)src/rustllvm/llvm-auto-clean-trigger
 	@$$(call E, make: cleaning llvm)
-	$(Q)touch $$@.start_time
-	$(Q)$(MAKE) clean-llvm$(1)
+	$$(Q)touch $$@.start_time
+	$$(Q)$$(MAKE) clean-llvm$(1)
 	@$$(call E, make: done cleaning llvm)
 	touch -r $$@.start_time $$@ && rm $$@.start_time
 
 ifeq ($$(CFG_ENABLE_LLVM_STATIC_STDCPP),1)
 LLVM_STDCPP_RUSTFLAGS_$(1) = -L "$$(dir $$(shell $$(CC_$(1)) $$(CFG_GCCISH_CFLAGS_$(1)) \
-					-print-file-name=libstdc++.a))"
+					-print-file-name=lib$(CFG_STDCPP_NAME).a))"
 else
 LLVM_STDCPP_RUSTFLAGS_$(1) =
 endif
 
 
 # LLVM linkage:
+# Note: Filter with llvm-config so that optional targets which aren't present
+# don't cause errors (ie PNaCl's target is only present within PNaCl's LLVM
+# fork).
 LLVM_LINKAGE_PATH_$(1):=$$(abspath $$(RT_OUTPUT_DIR_$(1))/llvmdeps.rs)
 $$(LLVM_LINKAGE_PATH_$(1)): $(S)src/etc/mklldeps.py $$(LLVM_CONFIG_$(1))
-	$(Q)$(CFG_PYTHON) "$$<" "$$@" "$$(LLVM_COMPONENTS)" "$$(CFG_ENABLE_LLVM_STATIC_STDCPP)" \
-		$$(LLVM_CONFIG_$(1))
+	$(Q)$(CFG_PYTHON) "$$<" "$$@" "$$(filter $$(shell \
+				$$(LLVM_CONFIG_$(1)) --components), \
+                        $(LLVM_OPTIONAL_COMPONENTS)) $(LLVM_REQUIRED_COMPONENTS)" \
+		"$$(CFG_ENABLE_LLVM_STATIC_STDCPP)" $$(LLVM_CONFIG_$(1)) \
+		"$(CFG_STDCPP_NAME)" "$$(CFG_USING_LIBCPP)"
 endef
 
 $(foreach host,$(CFG_HOST), \
@@ -95,6 +116,8 @@ $(foreach host,$(CFG_HOST), \
 # This can't be done in target.mk because it's included before this file.
 define LLVM_LINKAGE_DEPS
 $$(TLIB$(1)_T_$(2)_H_$(3))/stamp.rustc_llvm: $$(LLVM_LINKAGE_PATH_$(2))
+RUSTFLAGS$(1)_rustc_llvm_T_$(2) += $$(shell echo $$(LLVM_ALL_COMPONENTS_$(2)) | tr '-' '_' |\
+	sed -e 's/^ //;s/\([^ ]*\)/\-\-cfg "llvm_component=\\"\1\\""/g')
 endef
 
 $(foreach source,$(CFG_HOST), \

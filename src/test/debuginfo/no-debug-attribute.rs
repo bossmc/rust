@@ -23,17 +23,22 @@
 // gdb-command:continue
 
 #![allow(unused_variables)]
+#![feature(no_debug)]
+#![feature(omit_gdb_pretty_printer_section)]
 #![omit_gdb_pretty_printer_section]
+
+#[inline(never)]
+fn id<T>(x: T) -> T {x}
 
 fn function_with_debuginfo() {
     let abc = 10_usize;
-    return (); // #break
+    id(abc); // #break
 }
 
 #[no_debug]
 fn function_without_debuginfo() {
     let abc = -57i32;
-    return (); // #break
+    id(abc); // #break
 }
 
 fn main() {

@@ -14,26 +14,34 @@ use rustc::session::{self, config};
 use llvm;
 use llvm::archive_ro::ArchiveRO;
 use llvm::{ModuleRef, TargetMachineRef, True, False};
-use rustc::metadata::cstore;
 use rustc::util::common::time;
+use rustc::util::common::path2cstr;
+use back::write::{ModuleConfig, with_llvm_pmb};
 
 use libc;
 use flate;
 
 use std::ffi::CString;
+use std::path::Path;
 
 pub fn run(sess: &session::Session, llmod: ModuleRef,
-           tm: TargetMachineRef, reachable: &[String]) {
+           tm: TargetMachineRef, reachable: &[String],
+           config: &ModuleConfig,
+           temp_no_opt_bc_filename: &Path) {
     if sess.opts.cg.prefer_dynamic {
-        sess.err("cannot prefer dynamic linking when performing LTO");
-        sess.note("only 'staticlib' and 'bin' outputs are supported with LTO");
+        sess.struct_err("cannot prefer dynamic linking when performing LTO")
+            .note("only 'staticlib', 'bin', and 'cdylib' outputs are \
+                   supported with LTO")
+            .emit();
         sess.abort_if_errors();
     }
 
     // Make sure we actually can run LTO
     for crate_type in sess.crate_types.borrow().iter() {
         match *crate_type {
-            config::CrateTypeExecutable | config::CrateTypeStaticlib => {}
+            config::CrateTypeExecutable |
+            config::CrateTypeCdylib |
+            config::CrateTypeStaticlib => {}
             _ => {
                 sess.fatal("lto can only be run for executables and \
                             static library outputs");
@@ -44,26 +52,21 @@ pub fn run(sess: &session::Session, llmod: ModuleRef,
     // For each of our upstream dependencies, find the corresponding rlib and
     // load the bitcode from the archive. Then merge it into the current LLVM
     // module that we've got.
-    let crates = sess.cstore.get_used_crates(cstore::RequireStatic);
-    for (cnum, path) in crates {
-        let name = sess.cstore.get_crate_data(cnum).name.clone();
-        let path = match path {
-            Some(p) => p,
-            None => {
-                sess.fatal(&format!("could not find rlib for: `{}`",
-                                   name));
-            }
-        };
+    link::each_linked_rlib(sess, &mut |cnum, path| {
+        // `#![no_builtins]` crates don't participate in LTO.
+        if sess.cstore.is_no_builtins(cnum) {
+            return;
+        }
 
         let archive = ArchiveRO::open(&path).expect("wanted an rlib");
         let bytecodes = archive.iter().filter_map(|child| {
-            child.name().map(|name| (name, child))
+            child.ok().and_then(|c| c.name().map(|name| (name, c)))
         }).filter(|&(name, _)| name.ends_with("bytecode.deflate"));
         for (name, data) in bytecodes {
             let bc_encoded = data.data();
 
             let bc_decoded = if is_versioned_bytecode_format(bc_encoded) {
-                time(sess.time_passes(), &format!("decode {}", name), (), |_| {
+                time(sess.time_passes(), &format!("decode {}", name), || {
                     // Read the version
                     let version = extract_bytecode_format_version(bc_encoded);
 
@@ -87,9 +90,10 @@ pub fn run(sess: &session::Session, llmod: ModuleRef,
                     }
                 })
             } else {
-                time(sess.time_passes(), &format!("decode {}", name), (), |_| {
-                // the object must be in the old, pre-versioning format, so simply
-                // inflate everything and let LLVM decide if it can make sense of it
+                time(sess.time_passes(), &format!("decode {}", name), || {
+                    // the object must be in the old, pre-versioning format, so
+                    // simply inflate everything and let LLVM decide if it can
+                    // make sense of it
                     match flate::inflate_bytes(bc_encoded) {
                         Ok(bc) => bc,
                         Err(_) => {
@@ -102,18 +106,17 @@ pub fn run(sess: &session::Session, llmod: ModuleRef,
 
             let ptr = bc_decoded.as_ptr();
             debug!("linking {}", name);
-            time(sess.time_passes(), &format!("ll link {}", name), (),
-                 |()| unsafe {
+            time(sess.time_passes(), &format!("ll link {}", name), || unsafe {
                 if !llvm::LLVMRustLinkInExternalBitcode(llmod,
                                                         ptr as *const libc::c_char,
                                                         bc_decoded.len() as libc::size_t) {
-                    write::llvm_err(sess.diagnostic().handler(),
+                    write::llvm_err(sess.diagnostic(),
                                     format!("failed to load bc of `{}`",
                                             &name[..]));
                 }
             });
         }
-    }
+    });
 
     // Internalize everything but the reachable symbols of the current module
     let cstrs: Vec<CString> = reachable.iter().map(|s| {
@@ -133,6 +136,13 @@ pub fn run(sess: &session::Session, llmod: ModuleRef,
         }
     }
 
+    if sess.opts.cg.save_temps {
+        let cstr = path2cstr(temp_no_opt_bc_filename);
+        unsafe {
+            llvm::LLVMWriteBitcodeToFile(llmod, cstr.as_ptr());
+        }
+    }
+
     // Now we have one massive module inside of llmod. Time to run the
     // LTO-specific optimization passes that LLVM provides.
     //
@@ -142,25 +152,21 @@ pub fn run(sess: &session::Session, llmod: ModuleRef,
     unsafe {
         let pm = llvm::LLVMCreatePassManager();
         llvm::LLVMRustAddAnalysisPasses(tm, pm, llmod);
-        llvm::LLVMRustAddPass(pm, "verify\0".as_ptr() as *const _);
+        let pass = llvm::LLVMRustFindAndCreatePass("verify\0".as_ptr() as *const _);
+        assert!(!pass.is_null());
+        llvm::LLVMRustAddPass(pm, pass);
 
-        let opt = match sess.opts.optimize {
-            config::No => 0,
-            config::Less => 1,
-            config::Default => 2,
-            config::Aggressive => 3,
-        };
+        with_llvm_pmb(llmod, config, &mut |b| {
+            llvm::LLVMPassManagerBuilderPopulateLTOPassManager(b, pm,
+                /* Internalize = */ False,
+                /* RunInliner = */ True);
+        });
 
-        let builder = llvm::LLVMPassManagerBuilderCreate();
-        llvm::LLVMPassManagerBuilderSetOptLevel(builder, opt);
-        llvm::LLVMPassManagerBuilderPopulateLTOPassManager(builder, pm,
-            /* Internalize = */ False,
-            /* RunInliner = */ True);
-        llvm::LLVMPassManagerBuilderDispose(builder);
+        let pass = llvm::LLVMRustFindAndCreatePass("verify\0".as_ptr() as *const _);
+        assert!(!pass.is_null());
+        llvm::LLVMRustAddPass(pm, pass);
 
-        llvm::LLVMRustAddPass(pm, "verify\0".as_ptr() as *const _);
-
-        time(sess.time_passes(), "LTO passes", (), |()|
+        time(sess.time_passes(), "LTO passes", ||
              llvm::LLVMRunPassManager(pm, llmod));
 
         llvm::LLVMDisposePassManager(pm);

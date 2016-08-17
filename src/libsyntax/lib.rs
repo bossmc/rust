@@ -14,68 +14,86 @@
 //!
 //! This API is completely unstable and subject to change.
 
-// Do not remove on snapshot creation. Needed for bootstrap. (Issue #22364)
-#![cfg_attr(stage0, feature(custom_attribute))]
 #![crate_name = "syntax"]
-#![unstable(feature = "rustc_private")]
-#![staged_api]
+#![unstable(feature = "rustc_private", issue = "27812")]
 #![crate_type = "dylib"]
 #![crate_type = "rlib"]
-#![doc(html_logo_url = "http://www.rust-lang.org/logos/rust-logo-128x128-blk-v2.png",
+#![doc(html_logo_url = "https://www.rust-lang.org/logos/rust-logo-128x128-blk-v2.png",
        html_favicon_url = "https://doc.rust-lang.org/favicon.ico",
-       html_root_url = "http://doc.rust-lang.org/nightly/")]
+       html_root_url = "https://doc.rust-lang.org/nightly/",
+       test(attr(deny(warnings))))]
+#![cfg_attr(not(stage0), deny(warnings))]
 
 #![feature(associated_consts)]
-#![feature(bitset)]
-#![feature(drain)]
+#![feature(const_fn)]
 #![feature(filling_drop)]
 #![feature(libc)]
-#![feature(ref_slice)]
 #![feature(rustc_private)]
-#![feature(set_stdio)]
 #![feature(staged_api)]
-#![feature(str_char)]
 #![feature(str_escape)]
 #![feature(unicode)]
-#![feature(vec_push_all)]
+#![feature(question_mark)]
+#![feature(rustc_diagnostic_macros)]
 
-extern crate fmt_macros;
 extern crate serialize;
 extern crate term;
 extern crate libc;
 #[macro_use] extern crate log;
 #[macro_use] #[no_link] extern crate rustc_bitflags;
+extern crate rustc_unicode;
+pub extern crate rustc_errors as errors;
+extern crate syntax_pos;
 
 extern crate serialize as rustc_serialize; // used by deriving
 
-// A variant of 'try!' that panics on Err(FatalError). This is used as a
-// crutch on the way towards a non-panic!-prone parser. It should be used
-// for fatal parsing errors; eventually we plan to convert all code using
-// panictry to just use normal try
+
+// A variant of 'try!' that panics on an Err. This is used as a crutch on the
+// way towards a non-panic!-prone parser. It should be used for fatal parsing
+// errors; eventually we plan to convert all code using panictry to just use
+// normal try.
+// Exported for syntax_ext, not meant for general use.
+#[macro_export]
 macro_rules! panictry {
     ($e:expr) => ({
         use std::result::Result::{Ok, Err};
-        use diagnostic::FatalError;
+        use errors::FatalError;
         match $e {
             Ok(e) => e,
-            Err(FatalError) => panic!(FatalError)
+            Err(mut e) => {
+                e.emit();
+                panic!(FatalError);
+            }
         }
     })
 }
 
+#[macro_use]
+pub mod diagnostics {
+    #[macro_use]
+    pub mod macros;
+    pub mod plugin;
+    pub mod metadata;
+}
+
+// NB: This module needs to be declared first so diagnostics are
+// registered before they are used.
+pub mod diagnostic_list;
+
 pub mod util {
     pub mod interner;
+    pub mod lev_distance;
+    pub mod node_count;
+    pub mod parser;
     #[cfg(test)]
     pub mod parser_testing;
     pub mod small_vector;
+    pub mod move_map;
+
+    mod thin_vec;
+    pub use self::thin_vec::ThinVec;
 }
 
-pub mod diagnostics {
-    pub mod macros;
-    pub mod plugin;
-    pub mod registry;
-    pub mod metadata;
-}
+pub mod json;
 
 pub mod syntax {
     pub use ext;
@@ -85,20 +103,19 @@ pub mod syntax {
 
 pub mod abi;
 pub mod ast;
-pub mod ast_util;
 pub mod attr;
 pub mod codemap;
 pub mod config;
-pub mod diagnostic;
+pub mod entry;
 pub mod feature_gate;
 pub mod fold;
-pub mod owned_slice;
 pub mod parse;
 pub mod ptr;
 pub mod show_span;
 pub mod std_inject;
 pub mod str;
 pub mod test;
+pub mod tokenstream;
 pub mod visit;
 
 pub mod print {
@@ -107,21 +124,13 @@ pub mod print {
 }
 
 pub mod ext {
-    pub mod asm;
     pub mod base;
     pub mod build;
-    pub mod cfg;
-    pub mod concat;
-    pub mod concat_idents;
-    pub mod deriving;
-    pub mod env;
     pub mod expand;
-    pub mod format;
-    pub mod log_syntax;
-    pub mod mtwt;
+    pub mod hygiene;
+    pub mod proc_macro_shim;
     pub mod quote;
     pub mod source_util;
-    pub mod trace_macros;
 
     pub mod tt {
         pub mod transcribe;
@@ -129,3 +138,5 @@ pub mod ext {
         pub mod macro_rules;
     }
 }
+
+// __build_diagnostic_array! { libsyntax, DIAGNOSTICS }

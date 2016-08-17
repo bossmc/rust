@@ -99,6 +99,7 @@
 
 #![allow(unused_variables)]
 #![allow(dead_code)]
+#![feature(omit_gdb_pretty_printer_section)]
 #![omit_gdb_pretty_printer_section]
 
 use self::AutoDiscriminant::{One, Two, Three};
@@ -156,7 +157,8 @@ fn main() {
 
     zzz(); // #break
 
-    let a = SINGLE_VARIANT;
+    // Borrow to avoid an eager load of the constant value in the static.
+    let a = &SINGLE_VARIANT;
     let a = unsafe { AUTO_ONE };
     let a = unsafe { MANUAL_ONE };
 }

@@ -13,7 +13,9 @@ use prelude::v1::*;
 use cell::UnsafeCell;
 use fmt;
 use marker;
+use mem;
 use ops::{Deref, DerefMut};
+use ptr;
 use sys_common::mutex as sys;
 use sys_common::poison::{self, TryLockError, TryLockResult, LockResult};
 
@@ -64,7 +66,7 @@ use sys_common::poison::{self, TryLockError, TryLockResult, LockResult};
 /// for _ in 0..10 {
 ///     let (data, tx) = (data.clone(), tx.clone());
 ///     thread::spawn(move || {
-///         // The shared static can only be accessed once the lock is held.
+///         // The shared state can only be accessed once the lock is held.
 ///         // Our non-atomic increment is safe because we're the only thread
 ///         // which can access the shared state when the lock is held.
 ///         //
@@ -94,7 +96,7 @@ use sys_common::poison::{self, TryLockError, TryLockResult, LockResult};
 /// let _ = thread::spawn(move || -> () {
 ///     // This thread will acquire the mutex first, unwrapping the result of
 ///     // `lock` because the lock has not been poisoned.
-///     let _lock = lock2.lock().unwrap();
+///     let _guard = lock2.lock().unwrap();
 ///
 ///     // This panic while holding the lock (`_guard` is in scope) will poison
 ///     // the mutex.
@@ -112,49 +114,22 @@ use sys_common::poison::{self, TryLockError, TryLockResult, LockResult};
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct Mutex<T: ?Sized> {
-    // Note that this static mutex is in a *box*, not inlined into the struct
-    // itself. Once a native mutex has been used once, its address can never
-    // change (it can't be moved). This mutex type can be safely moved at any
-    // time, so to ensure that the native mutex is used correctly we box the
-    // inner lock to give it a constant address.
-    inner: Box<StaticMutex>,
+    // Note that this mutex is in a *box*, not inlined into the struct itself.
+    // Once a native mutex has been used once, its address can never change (it
+    // can't be moved). This mutex type can be safely moved at any time, so to
+    // ensure that the native mutex is used correctly we box the inner lock to
+    // give it a constant address.
+    inner: Box<sys::Mutex>,
+    poison: poison::Flag,
     data: UnsafeCell<T>,
 }
 
 // these are the only places where `T: Send` matters; all other
 // functionality works fine on a single thread.
+#[stable(feature = "rust1", since = "1.0.0")]
 unsafe impl<T: ?Sized + Send> Send for Mutex<T> { }
-
+#[stable(feature = "rust1", since = "1.0.0")]
 unsafe impl<T: ?Sized + Send> Sync for Mutex<T> { }
-
-/// The static mutex type is provided to allow for static allocation of mutexes.
-///
-/// Note that this is a separate type because using a Mutex correctly means that
-/// it needs to have a destructor run. In Rust, statics are not allowed to have
-/// destructors. As a result, a `StaticMutex` has one extra method when compared
-/// to a `Mutex`, a `destroy` method. This method is unsafe to call, and
-/// documentation can be found directly on the method.
-///
-/// # Examples
-///
-/// ```
-/// # #![feature(static_mutex)]
-/// use std::sync::{StaticMutex, MUTEX_INIT};
-///
-/// static LOCK: StaticMutex = MUTEX_INIT;
-///
-/// {
-///     let _g = LOCK.lock().unwrap();
-///     // do some productive work
-/// }
-/// // lock is unlocked here.
-/// ```
-#[unstable(feature = "static_mutex",
-           reason = "may be merged with Mutex in the future")]
-pub struct StaticMutex {
-    lock: sys::Mutex,
-    poison: poison::Flag,
-}
 
 /// An RAII implementation of a "scoped lock" of a mutex. When this structure is
 /// dropped (falls out of scope), the lock will be unlocked.
@@ -166,27 +141,26 @@ pub struct StaticMutex {
 pub struct MutexGuard<'a, T: ?Sized + 'a> {
     // funny underscores due to how Deref/DerefMut currently work (they
     // disregard field privacy).
-    __lock: &'a StaticMutex,
-    __data: &'a UnsafeCell<T>,
+    __lock: &'a Mutex<T>,
     __poison: poison::Guard,
 }
 
+#[stable(feature = "rust1", since = "1.0.0")]
 impl<'a, T: ?Sized> !marker::Send for MutexGuard<'a, T> {}
-
-/// Static initialization of a mutex. This constant can be used to initialize
-/// other mutex constants.
-#[unstable(feature = "static_mutex",
-           reason = "may be merged with Mutex in the future")]
-pub const MUTEX_INIT: StaticMutex = StaticMutex::new();
 
 impl<T> Mutex<T> {
     /// Creates a new mutex in an unlocked state ready for use.
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn new(t: T) -> Mutex<T> {
-        Mutex {
-            inner: box StaticMutex::new(),
+        let mut m = Mutex {
+            inner: box sys::Mutex::new(),
+            poison: poison::Flag::new(),
             data: UnsafeCell::new(t),
+        };
+        unsafe {
+            m.inner.init();
         }
+        m
     }
 }
 
@@ -198,14 +172,25 @@ impl<T: ?Sized> Mutex<T> {
     /// held. An RAII guard is returned to allow scoped unlock of the lock. When
     /// the guard goes out of scope, the mutex will be unlocked.
     ///
-    /// # Failure
+    /// The exact behavior on locking a mutex in the thread which already holds
+    /// the lock is left unspecified. However, this function will not return on
+    /// the second call (it might panic or deadlock, for example).
+    ///
+    /// # Errors
     ///
     /// If another user of this mutex panicked while holding the mutex, then
     /// this call will return an error once the mutex is acquired.
+    ///
+    /// # Panics
+    ///
+    /// This function might panic when called if the lock is already held by
+    /// the current thread.
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn lock(&self) -> LockResult<MutexGuard<T>> {
-        unsafe { self.inner.lock.lock() }
-        MutexGuard::new(&*self.inner, &self.data)
+        unsafe {
+            self.inner.lock();
+            MutexGuard::new(self)
+        }
     }
 
     /// Attempts to acquire this lock.
@@ -216,17 +201,19 @@ impl<T: ?Sized> Mutex<T> {
     ///
     /// This function does not block.
     ///
-    /// # Failure
+    /// # Errors
     ///
     /// If another user of this mutex panicked while holding the mutex, then
     /// this call will return failure if the mutex would otherwise be
     /// acquired.
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn try_lock(&self) -> TryLockResult<MutexGuard<T>> {
-        if unsafe { self.inner.lock.try_lock() } {
-            Ok(try!(MutexGuard::new(&*self.inner, &self.data)))
-        } else {
-            Err(TryLockError::WouldBlock)
+        unsafe {
+            if self.inner.try_lock() {
+                Ok(MutexGuard::new(self)?)
+            } else {
+                Err(TryLockError::WouldBlock)
+            }
         }
     }
 
@@ -238,22 +225,77 @@ impl<T: ?Sized> Mutex<T> {
     #[inline]
     #[stable(feature = "sync_poison", since = "1.2.0")]
     pub fn is_poisoned(&self) -> bool {
-        self.inner.poison.get()
+        self.poison.get()
+    }
+
+    /// Consumes this mutex, returning the underlying data.
+    ///
+    /// # Errors
+    ///
+    /// If another user of this mutex panicked while holding the mutex, then
+    /// this call will return an error instead.
+    #[stable(feature = "mutex_into_inner", since = "1.6.0")]
+    pub fn into_inner(self) -> LockResult<T> where T: Sized {
+        // We know statically that there are no outstanding references to
+        // `self` so there's no need to lock the inner lock.
+        //
+        // To get the inner value, we'd like to call `data.into_inner()`,
+        // but because `Mutex` impl-s `Drop`, we can't move out of it, so
+        // we'll have to destructure it manually instead.
+        unsafe {
+            // Like `let Mutex { inner, poison, data } = self`.
+            let (inner, poison, data) = {
+                let Mutex { ref inner, ref poison, ref data } = self;
+                (ptr::read(inner), ptr::read(poison), ptr::read(data))
+            };
+            mem::forget(self);
+            inner.destroy();  // Keep in sync with the `Drop` impl.
+            drop(inner);
+
+            poison::map_result(poison.borrow(), |_| data.into_inner())
+        }
+    }
+
+    /// Returns a mutable reference to the underlying data.
+    ///
+    /// Since this call borrows the `Mutex` mutably, no actual locking needs to
+    /// take place---the mutable borrow statically guarantees no locks exist.
+    ///
+    /// # Errors
+    ///
+    /// If another user of this mutex panicked while holding the mutex, then
+    /// this call will return an error instead.
+    #[stable(feature = "mutex_get_mut", since = "1.6.0")]
+    pub fn get_mut(&mut self) -> LockResult<&mut T> {
+        // We know statically that there are no other references to `self`, so
+        // there's no need to lock the inner lock.
+        let data = unsafe { &mut *self.data.get() };
+        poison::map_result(self.poison.borrow(), |_| data )
     }
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<T: ?Sized> Drop for Mutex<T> {
+    #[unsafe_destructor_blind_to_params]
     fn drop(&mut self) {
         // This is actually safe b/c we know that there is no further usage of
         // this mutex (it's up to the user to arrange for a mutex to get
         // dropped, that's not our job)
-        unsafe { self.inner.lock.destroy() }
+        //
+        // IMPORTANT: This code must be kept in sync with `Mutex::into_inner`.
+        unsafe { self.inner.destroy() }
+    }
+}
+
+#[stable(feature = "mutex_default", since = "1.9.0")]
+impl<T: ?Sized + Default> Default for Mutex<T> {
+    fn default() -> Mutex<T> {
+        Mutex::new(Default::default())
     }
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
-impl<T: ?Sized + fmt::Debug + 'static> fmt::Debug for Mutex<T> {
+impl<T: ?Sized + fmt::Debug> fmt::Debug for Mutex<T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self.try_lock() {
             Ok(guard) => write!(f, "Mutex {{ data: {:?} }}", &*guard),
@@ -265,61 +307,11 @@ impl<T: ?Sized + fmt::Debug + 'static> fmt::Debug for Mutex<T> {
     }
 }
 
-struct Dummy(UnsafeCell<()>);
-unsafe impl Sync for Dummy {}
-static DUMMY: Dummy = Dummy(UnsafeCell::new(()));
-
-#[unstable(feature = "static_mutex",
-           reason = "may be merged with Mutex in the future")]
-impl StaticMutex {
-    /// Creates a new mutex in an unlocked state ready for use.
-    pub const fn new() -> StaticMutex {
-        StaticMutex {
-            lock: sys::Mutex::new(),
-            poison: poison::Flag::new(),
-        }
-    }
-
-    /// Acquires this lock, see `Mutex::lock`
-    #[inline]
-    pub fn lock(&'static self) -> LockResult<MutexGuard<()>> {
-        unsafe { self.lock.lock() }
-        MutexGuard::new(self, &DUMMY.0)
-    }
-
-    /// Attempts to grab this lock, see `Mutex::try_lock`
-    #[inline]
-    pub fn try_lock(&'static self) -> TryLockResult<MutexGuard<()>> {
-        if unsafe { self.lock.try_lock() } {
-            Ok(try!(MutexGuard::new(self, &DUMMY.0)))
-        } else {
-            Err(TryLockError::WouldBlock)
-        }
-    }
-
-    /// Deallocates resources associated with this static mutex.
-    ///
-    /// This method is unsafe because it provides no guarantees that there are
-    /// no active users of this mutex, and safety is not guaranteed if there are
-    /// active users of this mutex.
-    ///
-    /// This method is required to ensure that there are no memory leaks on
-    /// *all* platforms. It may be the case that some platforms do not leak
-    /// memory if this method is not called, but this is not guaranteed to be
-    /// true on all platforms.
-    pub unsafe fn destroy(&'static self) {
-        self.lock.destroy()
-    }
-}
-
 impl<'mutex, T: ?Sized> MutexGuard<'mutex, T> {
-
-    fn new(lock: &'mutex StaticMutex, data: &'mutex UnsafeCell<T>)
-           -> LockResult<MutexGuard<'mutex, T>> {
+    unsafe fn new(lock: &'mutex Mutex<T>) -> LockResult<MutexGuard<'mutex, T>> {
         poison::map_result(lock.poison.borrow(), |guard| {
             MutexGuard {
                 __lock: lock,
-                __data: data,
                 __poison: guard,
             }
         })
@@ -330,14 +322,15 @@ impl<'mutex, T: ?Sized> MutexGuard<'mutex, T> {
 impl<'mutex, T: ?Sized> Deref for MutexGuard<'mutex, T> {
     type Target = T;
 
-    fn deref<'a>(&'a self) -> &'a T {
-        unsafe { &*self.__data.get() }
+    fn deref(&self) -> &T {
+        unsafe { &*self.__lock.data.get() }
     }
 }
+
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<'mutex, T: ?Sized> DerefMut for MutexGuard<'mutex, T> {
-    fn deref_mut<'a>(&'a mut self) -> &'a mut T {
-        unsafe { &mut *self.__data.get() }
+    fn deref_mut(&mut self) -> &mut T {
+        unsafe { &mut *self.__lock.data.get() }
     }
 }
 
@@ -347,13 +340,13 @@ impl<'a, T: ?Sized> Drop for MutexGuard<'a, T> {
     fn drop(&mut self) {
         unsafe {
             self.__lock.poison.done(&self.__poison);
-            self.__lock.lock.unlock();
+            self.__lock.inner.unlock();
         }
     }
 }
 
 pub fn guard_lock<'a, T: ?Sized>(guard: &MutexGuard<'a, T>) -> &'a sys::Mutex {
-    &guard.__lock.lock
+    &guard.__lock.inner
 }
 
 pub fn guard_poison<'a, T: ?Sized>(guard: &MutexGuard<'a, T>) -> &'a poison::Flag {
@@ -365,10 +358,14 @@ mod tests {
     use prelude::v1::*;
 
     use sync::mpsc::channel;
-    use sync::{Arc, Mutex, StaticMutex, Condvar};
+    use sync::{Arc, Mutex, Condvar};
+    use sync::atomic::{AtomicUsize, Ordering};
     use thread;
 
-    struct Packet<T: Send>(Arc<(Mutex<T>, Condvar)>);
+    struct Packet<T>(Arc<(Mutex<T>, Condvar)>);
+
+    #[derive(Eq, PartialEq, Debug)]
+    struct NonCopy(i32);
 
     unsafe impl<T: Send> Send for Packet<T> {}
     unsafe impl<T> Sync for Packet<T> {}
@@ -381,53 +378,102 @@ mod tests {
     }
 
     #[test]
-    fn smoke_static() {
-        static M: StaticMutex = StaticMutex::new();
-        unsafe {
-            drop(M.lock().unwrap());
-            drop(M.lock().unwrap());
-            M.destroy();
-        }
-    }
-
-    #[test]
     fn lots_and_lots() {
-        static M: StaticMutex = StaticMutex::new();
-        static mut CNT: u32 = 0;
         const J: u32 = 1000;
         const K: u32 = 3;
 
-        fn inc() {
+        let m = Arc::new(Mutex::new(0));
+
+        fn inc(m: &Mutex<u32>) {
             for _ in 0..J {
-                unsafe {
-                    let _g = M.lock().unwrap();
-                    CNT += 1;
-                }
+                *m.lock().unwrap() += 1;
             }
         }
 
         let (tx, rx) = channel();
         for _ in 0..K {
             let tx2 = tx.clone();
-            thread::spawn(move|| { inc(); tx2.send(()).unwrap(); });
+            let m2 = m.clone();
+            thread::spawn(move|| { inc(&m2); tx2.send(()).unwrap(); });
             let tx2 = tx.clone();
-            thread::spawn(move|| { inc(); tx2.send(()).unwrap(); });
+            let m2 = m.clone();
+            thread::spawn(move|| { inc(&m2); tx2.send(()).unwrap(); });
         }
 
         drop(tx);
         for _ in 0..2 * K {
             rx.recv().unwrap();
         }
-        assert_eq!(unsafe {CNT}, J * K * 2);
-        unsafe {
-            M.destroy();
-        }
+        assert_eq!(*m.lock().unwrap(), J * K * 2);
     }
 
     #[test]
     fn try_lock() {
         let m = Mutex::new(());
         *m.try_lock().unwrap() = ();
+    }
+
+    #[test]
+    fn test_into_inner() {
+        let m = Mutex::new(NonCopy(10));
+        assert_eq!(m.into_inner().unwrap(), NonCopy(10));
+    }
+
+    #[test]
+    fn test_into_inner_drop() {
+        struct Foo(Arc<AtomicUsize>);
+        impl Drop for Foo {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let num_drops = Arc::new(AtomicUsize::new(0));
+        let m = Mutex::new(Foo(num_drops.clone()));
+        assert_eq!(num_drops.load(Ordering::SeqCst), 0);
+        {
+            let _inner = m.into_inner().unwrap();
+            assert_eq!(num_drops.load(Ordering::SeqCst), 0);
+        }
+        assert_eq!(num_drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_into_inner_poison() {
+        let m = Arc::new(Mutex::new(NonCopy(10)));
+        let m2 = m.clone();
+        let _ = thread::spawn(move || {
+            let _lock = m2.lock().unwrap();
+            panic!("test panic in inner thread to poison mutex");
+        }).join();
+
+        assert!(m.is_poisoned());
+        match Arc::try_unwrap(m).unwrap().into_inner() {
+            Err(e) => assert_eq!(e.into_inner(), NonCopy(10)),
+            Ok(x) => panic!("into_inner of poisoned Mutex is Ok: {:?}", x),
+        }
+    }
+
+    #[test]
+    fn test_get_mut() {
+        let mut m = Mutex::new(NonCopy(10));
+        *m.get_mut().unwrap() = NonCopy(20);
+        assert_eq!(m.into_inner().unwrap(), NonCopy(20));
+    }
+
+    #[test]
+    fn test_get_mut_poison() {
+        let m = Arc::new(Mutex::new(NonCopy(10)));
+        let m2 = m.clone();
+        let _ = thread::spawn(move || {
+            let _lock = m2.lock().unwrap();
+            panic!("test panic in inner thread to poison mutex");
+        }).join();
+
+        assert!(m.is_poisoned());
+        match Arc::try_unwrap(m).unwrap().get_mut() {
+            Err(e) => assert_eq!(*e.into_inner(), NonCopy(10)),
+            Ok(x) => panic!("get_mut of poisoned Mutex is Ok: {:?}", x),
+        }
     }
 
     #[test]
@@ -531,16 +577,15 @@ mod tests {
         assert_eq!(*lock, 2);
     }
 
-    // FIXME(#25351) needs deeply nested coercions of DST structs.
-    // #[test]
-    // fn test_mutex_unsized() {
-    //     let mutex: &Mutex<[i32]> = &Mutex::new([1, 2, 3]);
-    //     {
-    //         let b = &mut *mutex.lock().unwrap();
-    //         b[0] = 4;
-    //         b[2] = 5;
-    //     }
-    //     let comp: &[i32] = &[4, 2, 5];
-    //     assert_eq!(&*mutex.lock().unwrap(), comp);
-    // }
+    #[test]
+    fn test_mutex_unsized() {
+        let mutex: &Mutex<[i32]> = &Mutex::new([1, 2, 3]);
+        {
+            let b = &mut *mutex.lock().unwrap();
+            b[0] = 4;
+            b[2] = 5;
+        }
+        let comp: &[i32] = &[4, 2, 5];
+        assert_eq!(&*mutex.lock().unwrap(), comp);
+    }
 }

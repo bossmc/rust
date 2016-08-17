@@ -27,8 +27,7 @@
 //! rustc will search each directory in the environment variable
 //! `RUST_TARGET_PATH` for a file named `TRIPLE.json`. The first one found will
 //! be loaded. If no file is found in any of those directories, a fatal error
-//! will be given.  `RUST_TARGET_PATH` includes `/etc/rustc` as its last entry,
-//! to be searched by default.
+//! will be given.
 //!
 //! Projects defining their own targets should use
 //! `--target=path/to/my-awesome-platform.json` instead of adding to
@@ -40,15 +39,16 @@
 //! this module defines the format the JSON file should take, though each
 //! underscore in the field names should be replaced with a hyphen (`-`) in the
 //! JSON file. Some fields are required in every target specification, such as
-//! `data-layout`, `llvm-target`, `target-endian`, `target-pointer-width`, and
-//! `arch`. In general, options passed to rustc with `-C` override the target's
-//! settings, though `target-feature` and `link-args` will *add* to the list
-//! specified by the target, rather than replace.
+//! `llvm-target`, `target-endian`, `target-pointer-width`, `data-layout`,
+//! `arch`, and `os`. In general, options passed to rustc with `-C` override
+//! the target's settings, though `target-feature` and `link-args` will *add*
+//! to the list specified by the target, rather than replace.
 
-use serialize::json::Json;
+use serialize::json::{Json, ToJson};
+use std::collections::BTreeMap;
 use std::default::Default;
 use std::io::prelude::*;
-use syntax::{diagnostic, abi};
+use syntax::abi::Abi;
 
 mod android_base;
 mod apple_base;
@@ -57,15 +57,135 @@ mod bitrig_base;
 mod dragonfly_base;
 mod freebsd_base;
 mod linux_base;
+mod linux_musl_base;
 mod openbsd_base;
 mod netbsd_base;
+mod solaris_base;
 mod windows_base;
 mod windows_msvc_base;
+
+pub type TargetResult = Result<Target, String>;
+
+macro_rules! supported_targets {
+    ( $(($triple:expr, $module:ident)),+ ) => (
+        $(mod $module;)*
+
+        /// List of supported targets
+        const TARGETS: &'static [&'static str] = &[$($triple),*];
+
+        fn load_specific(target: &str) -> TargetResult {
+            match target {
+                $(
+                    $triple => {
+                        let mut t = try!($module::target());
+                        t.options.is_builtin = true;
+
+                        // round-trip through the JSON parser to ensure at
+                        // run-time that the parser works correctly
+                        t = try!(Target::from_json(t.to_json()));
+                        debug!("Got builtin target: {:?}", t);
+                        Ok(t)
+                    },
+                )+
+                _ => Err(format!("Unable to find target: {}", target))
+            }
+        }
+
+        pub fn get_targets() -> Box<Iterator<Item=String>> {
+            Box::new(TARGETS.iter().filter_map(|t| -> Option<String> {
+                load_specific(t)
+                    .and(Ok(t.to_string()))
+                    .ok()
+            }))
+        }
+
+        #[cfg(test)]
+        mod test_json_encode_decode {
+            use serialize::json::ToJson;
+            use super::Target;
+            $(use super::$module;)*
+
+            $(
+                #[test]
+                fn $module() {
+                    // Grab the TargetResult struct. If we successfully retrieved
+                    // a Target, then the test JSON encoding/decoding can run for this
+                    // Target on this testing platform (i.e., checking the iOS targets
+                    // only on a Mac test platform).
+                    let _ = $module::target().map(|original| {
+                        let as_json = original.to_json();
+                        let parsed = Target::from_json(as_json).unwrap();
+                        assert_eq!(original, parsed);
+                    });
+                }
+            )*
+        }
+    )
+}
+
+supported_targets! {
+    ("x86_64-unknown-linux-gnu", x86_64_unknown_linux_gnu),
+    ("i686-unknown-linux-gnu", i686_unknown_linux_gnu),
+    ("i586-unknown-linux-gnu", i586_unknown_linux_gnu),
+    ("mips-unknown-linux-gnu", mips_unknown_linux_gnu),
+    ("mipsel-unknown-linux-gnu", mipsel_unknown_linux_gnu),
+    ("powerpc-unknown-linux-gnu", powerpc_unknown_linux_gnu),
+    ("powerpc64-unknown-linux-gnu", powerpc64_unknown_linux_gnu),
+    ("powerpc64le-unknown-linux-gnu", powerpc64le_unknown_linux_gnu),
+    ("arm-unknown-linux-gnueabi", arm_unknown_linux_gnueabi),
+    ("arm-unknown-linux-gnueabihf", arm_unknown_linux_gnueabihf),
+    ("arm-unknown-linux-musleabi", arm_unknown_linux_musleabi),
+    ("arm-unknown-linux-musleabihf", arm_unknown_linux_musleabihf),
+    ("armv7-unknown-linux-gnueabihf", armv7_unknown_linux_gnueabihf),
+    ("armv7-unknown-linux-musleabihf", armv7_unknown_linux_musleabihf),
+    ("aarch64-unknown-linux-gnu", aarch64_unknown_linux_gnu),
+    ("x86_64-unknown-linux-musl", x86_64_unknown_linux_musl),
+    ("i686-unknown-linux-musl", i686_unknown_linux_musl),
+    ("mips-unknown-linux-musl", mips_unknown_linux_musl),
+    ("mipsel-unknown-linux-musl", mipsel_unknown_linux_musl),
+
+    ("i686-linux-android", i686_linux_android),
+    ("arm-linux-androideabi", arm_linux_androideabi),
+    ("armv7-linux-androideabi", armv7_linux_androideabi),
+    ("aarch64-linux-android", aarch64_linux_android),
+
+    ("i686-unknown-freebsd", i686_unknown_freebsd),
+    ("x86_64-unknown-freebsd", x86_64_unknown_freebsd),
+
+    ("i686-unknown-dragonfly", i686_unknown_dragonfly),
+    ("x86_64-unknown-dragonfly", x86_64_unknown_dragonfly),
+
+    ("x86_64-unknown-bitrig", x86_64_unknown_bitrig),
+    ("x86_64-unknown-openbsd", x86_64_unknown_openbsd),
+    ("x86_64-unknown-netbsd", x86_64_unknown_netbsd),
+    ("x86_64-rumprun-netbsd", x86_64_rumprun_netbsd),
+
+    ("x86_64-apple-darwin", x86_64_apple_darwin),
+    ("i686-apple-darwin", i686_apple_darwin),
+
+    ("i386-apple-ios", i386_apple_ios),
+    ("x86_64-apple-ios", x86_64_apple_ios),
+    ("aarch64-apple-ios", aarch64_apple_ios),
+    ("armv7-apple-ios", armv7_apple_ios),
+    ("armv7s-apple-ios", armv7s_apple_ios),
+
+    ("x86_64-sun-solaris", x86_64_sun_solaris),
+
+    ("x86_64-pc-windows-gnu", x86_64_pc_windows_gnu),
+    ("i686-pc-windows-gnu", i686_pc_windows_gnu),
+
+    ("x86_64-pc-windows-msvc", x86_64_pc_windows_msvc),
+    ("i686-pc-windows-msvc", i686_pc_windows_msvc),
+    ("i586-pc-windows-msvc", i586_pc_windows_msvc),
+
+    ("le32-unknown-nacl", le32_unknown_nacl),
+    ("asmjs-unknown-emscripten", asmjs_unknown_emscripten)
+}
 
 /// Everything `rustc` knows about how to compile for a specific target.
 ///
 /// Every field here must be specified, and has no default value.
-#[derive(Clone, Debug)]
+#[derive(PartialEq, Clone, Debug)]
 pub struct Target {
     /// Target triple to pass to LLVM.
     pub llvm_target: String,
@@ -77,9 +197,13 @@ pub struct Target {
     pub target_os: String,
     /// Environment name to use for conditional compilation.
     pub target_env: String,
-    /// Architecture to use for ABI considerations. Valid options: "x86", "x86_64", "arm",
-    /// "aarch64", "mips", and "powerpc". "mips" includes "mipsel".
+    /// Vendor name to use for conditional compilation.
+    pub target_vendor: String,
+    /// Architecture to use for ABI considerations. Valid options: "x86",
+    /// "x86_64", "arm", "aarch64", "mips", "powerpc", and "powerpc64".
     pub arch: String,
+    /// [Data layout](http://llvm.org/docs/LangRef.html#data-layout) to pass to LLVM.
+    pub data_layout: String,
     /// Optional settings with defaults.
     pub options: TargetOptions,
 }
@@ -88,26 +212,36 @@ pub struct Target {
 ///
 /// This has an implementation of `Default`, see each field for what the default is. In general,
 /// these try to take "minimal defaults" that don't assume anything about the runtime they run in.
-#[derive(Clone, Debug)]
+#[derive(PartialEq, Clone, Debug)]
 pub struct TargetOptions {
-    /// [Data layout](http://llvm.org/docs/LangRef.html#data-layout) to pass to LLVM.
-    pub data_layout: String,
+    /// Whether the target is built-in or loaded from a custom target specification.
+    pub is_builtin: bool,
+
     /// Linker to invoke. Defaults to "cc".
     pub linker: String,
     /// Archive utility to use when managing archives. Defaults to "ar".
     pub ar: String,
+
     /// Linker arguments that are unconditionally passed *before* any
     /// user-defined libraries.
     pub pre_link_args: Vec<String>,
+    /// Objects to link before all others, always found within the
+    /// sysroot folder.
+    pub pre_link_objects_exe: Vec<String>, // ... when linking an executable
+    pub pre_link_objects_dll: Vec<String>, // ... when linking a dylib
+    /// Linker arguments that are unconditionally passed after any
+    /// user-defined but before post_link_objects.  Standard platform
+    /// libraries that should be always be linked to, usually go here.
+    pub late_link_args: Vec<String>,
+    /// Objects to link after all others, always found within the
+    /// sysroot folder.
+    pub post_link_objects: Vec<String>,
     /// Linker arguments that are unconditionally passed *after* any
     /// user-defined libraries.
     pub post_link_args: Vec<String>,
-    /// Objects to link before and after all others, always found within the
-    /// sysroot folder.
-    pub pre_link_objects: Vec<String>,
-    pub post_link_objects: Vec<String>,
+
     /// Default CPU to pass to LLVM. Corresponds to `llc -mcpu=$cpu`. Defaults
-    /// to "default".
+    /// to "generic".
     pub cpu: String,
     /// Default target features to pass to LLVM. These features will *always* be
     /// passed, and cannot be disabled even via `-C`. Corresponds to `llc
@@ -118,9 +252,6 @@ pub struct TargetOptions {
     /// Whether executables are available on this target. iOS, for example, only allows static
     /// libraries. Defaults to false.
     pub executables: bool,
-    /// Whether LLVM's segmented stack prelude is supported by whatever runtime is available.
-    /// Will emit stack checks and calls to __morestack. Defaults to false.
-    pub morestack: bool,
     /// Relocation model to use in object file. Corresponds to `llc
     /// -relocation-model=$relocation_model`. Defaults to "pic".
     pub relocation_model: String,
@@ -142,9 +273,15 @@ pub struct TargetOptions {
     pub staticlib_prefix: String,
     /// String to append to the name of every static library. Defaults to ".a".
     pub staticlib_suffix: String,
+    /// OS family to use for conditional compilation. Valid options: "unix", "windows".
+    pub target_family: Option<String>,
     /// Whether the target toolchain is like OSX's. Only useful for compiling against iOS/OS X, in
     /// particular running dsymutil and some other stuff like `-dead_strip`. Defaults to false.
     pub is_like_osx: bool,
+    /// Whether the target toolchain is like Solaris's.
+    /// Only useful for compiling against Illumos/Solaris,
+    /// as they have a different set of linker flags. Defaults to false.
+    pub is_like_solaris: bool,
     /// Whether the target toolchain is like Windows'. Only useful for compiling against Windows,
     /// only really used for figuring out how to find libraries, since Windows uses its own
     /// library naming convention. Defaults to false.
@@ -155,11 +292,21 @@ pub struct TargetOptions {
     pub is_like_android: bool,
     /// Whether the linker support GNU-like arguments such as -O. Defaults to false.
     pub linker_is_gnu: bool,
+    /// The MinGW toolchain has a known issue that prevents it from correctly
+    /// handling COFF object files with more than 2^15 sections. Since each weak
+    /// symbol needs its own COMDAT section, weak linkage implies a large
+    /// number sections that easily exceeds the given limit for larger
+    /// codebases. Consequently we want a way to disallow weak linkage on some
+    /// platforms.
+    pub allows_weak_linkage: bool,
     /// Whether the linker support rpaths or not. Defaults to false.
     pub has_rpath: bool,
     /// Whether to disable linking to compiler-rt. Defaults to false, as LLVM
     /// will emit references to the functions that compiler-rt provides.
     pub no_compiler_rt: bool,
+    /// Whether to disable linking to the default libraries, typically corresponds
+    /// to `-nodefaultlibs`. Defaults to true.
+    pub no_default_libraries: bool,
     /// Dynamically linked executables can be compiled as position independent
     /// if the default relocation model of position independent code is not
     /// changed. This is a requirement to take advantage of ASLR, as otherwise
@@ -171,6 +318,29 @@ pub struct TargetOptions {
     /// currently only "gnu" is used to fall into LLVM. Unknown strings cause
     /// the system linker to be used.
     pub archive_format: String,
+    /// Is asm!() allowed? Defaults to true.
+    pub allow_asm: bool,
+    /// Whether the target uses a custom unwind resumption routine.
+    /// By default LLVM lowers `resume` instructions into calls to `_Unwind_Resume`
+    /// defined in libgcc.  If this option is enabled, the target must provide
+    /// `eh_unwind_resume` lang item.
+    pub custom_unwind_resume: bool,
+
+    /// Default crate for allocation symbols to link against
+    pub lib_allocation_crate: String,
+    pub exe_allocation_crate: String,
+
+    /// Flag indicating whether ELF TLS (e.g. #[thread_local]) is available for
+    /// this target.
+    pub has_elf_tls: bool,
+    // This is mainly for easy compatibility with emscripten.
+    // If we give emcc .o files that are actually .bc files it
+    // will 'just work'.
+    pub obj_is_bitcode: bool,
+
+    /// Maximum integer size in bits that this target can perform atomic
+    /// operations on.
+    pub max_atomic_width: u64,
 }
 
 impl Default for TargetOptions {
@@ -178,16 +348,15 @@ impl Default for TargetOptions {
     /// incomplete, and if used for compilation, will certainly not work.
     fn default() -> TargetOptions {
         TargetOptions {
-            data_layout: String::new(),
-            linker: "cc".to_string(),
-            ar: "ar".to_string(),
+            is_builtin: false,
+            linker: option_env!("CFG_DEFAULT_LINKER").unwrap_or("cc").to_string(),
+            ar: option_env!("CFG_DEFAULT_AR").unwrap_or("ar").to_string(),
             pre_link_args: Vec::new(),
             post_link_args: Vec::new(),
             cpu: "generic".to_string(),
             features: "".to_string(),
             dynamic_linking: false,
             executables: false,
-            morestack: false,
             relocation_model: "pic".to_string(),
             code_model: "default".to_string(),
             disable_redzone: false,
@@ -198,30 +367,43 @@ impl Default for TargetOptions {
             exe_suffix: "".to_string(),
             staticlib_prefix: "lib".to_string(),
             staticlib_suffix: ".a".to_string(),
+            target_family: None,
             is_like_osx: false,
+            is_like_solaris: false,
             is_like_windows: false,
             is_like_android: false,
             is_like_msvc: false,
             linker_is_gnu: false,
+            allows_weak_linkage: true,
             has_rpath: false,
             no_compiler_rt: false,
+            no_default_libraries: true,
             position_independent_executables: false,
-            pre_link_objects: Vec::new(),
+            pre_link_objects_exe: Vec::new(),
+            pre_link_objects_dll: Vec::new(),
             post_link_objects: Vec::new(),
-            archive_format: String::new(),
+            late_link_args: Vec::new(),
+            archive_format: "gnu".to_string(),
+            custom_unwind_resume: false,
+            lib_allocation_crate: "alloc_system".to_string(),
+            exe_allocation_crate: "alloc_system".to_string(),
+            allow_asm: true,
+            has_elf_tls: false,
+            obj_is_bitcode: false,
+            max_atomic_width: 0,
         }
     }
 }
 
 impl Target {
     /// Given a function ABI, turn "System" into the correct ABI for this target.
-    pub fn adjust_abi(&self, abi: abi::Abi) -> abi::Abi {
+    pub fn adjust_abi(&self, abi: Abi) -> Abi {
         match abi {
-            abi::System => {
+            Abi::System => {
                 if self.options.is_like_windows && self.arch == "x86" {
-                    abi::Stdcall
+                    Abi::Stdcall
                 } else {
-                    abi::C
+                    Abi::C
                 }
             },
             abi => abi
@@ -229,32 +411,45 @@ impl Target {
     }
 
     /// Load a target descriptor from a JSON object.
-    pub fn from_json(obj: Json) -> Target {
-        // this is 1. ugly, 2. error prone.
-
-
-        let handler = diagnostic::Handler::new(diagnostic::Auto, None, true);
+    pub fn from_json(obj: Json) -> TargetResult {
+        // While ugly, this code must remain this way to retain
+        // compatibility with existing JSON fields and the internal
+        // expected naming of the Target and TargetOptions structs.
+        // To ensure compatibility is retained, the built-in targets
+        // are round-tripped through this code to catch cases where
+        // the JSON parser is not updated to match the structs.
 
         let get_req_field = |name: &str| {
             match obj.find(name)
                      .map(|s| s.as_string())
                      .and_then(|os| os.map(|s| s.to_string())) {
-                Some(val) => val,
-                None =>
-                    handler.fatal(&format!("Field {} in target specification is required", name))
+                Some(val) => Ok(val),
+                None => {
+                    return Err(format!("Field {} in target specification is required", name))
+                }
             }
         };
 
+        let get_opt_field = |name: &str, default: &str| {
+            obj.find(name).and_then(|s| s.as_string())
+               .map(|s| s.to_string())
+               .unwrap_or(default.to_string())
+        };
+
         let mut base = Target {
-            llvm_target: get_req_field("llvm-target"),
-            target_endian: get_req_field("target-endian"),
-            target_pointer_width: get_req_field("target-pointer-width"),
-            arch: get_req_field("arch"),
-            target_os: get_req_field("os"),
-            target_env: obj.find("env").and_then(|s| s.as_string())
-                           .map(|s| s.to_string()).unwrap_or(String::new()),
+            llvm_target: try!(get_req_field("llvm-target")),
+            target_endian: try!(get_req_field("target-endian")),
+            target_pointer_width: try!(get_req_field("target-pointer-width")),
+            data_layout: try!(get_req_field("data-layout")),
+            arch: try!(get_req_field("arch")),
+            target_os: try!(get_req_field("os")),
+            target_env: get_opt_field("env", ""),
+            target_vendor: get_opt_field("vendor", "unknown"),
             options: Default::default(),
         };
+
+        // Default max-atomic-width to target-pointer-width
+        base.options.max_atomic_width = base.target_pointer_width.parse().unwrap();
 
         macro_rules! key {
             ($key_name:ident) => ( {
@@ -268,6 +463,12 @@ impl Target {
                     .map(|o| o.as_boolean()
                          .map(|s| base.options.$key_name = s));
             } );
+            ($key_name:ident, u64) => ( {
+                let name = (stringify!($key_name)).replace("_", "-");
+                obj.find(&name[..])
+                    .map(|o| o.as_u64()
+                         .map(|s| base.options.$key_name = s));
+            } );
             ($key_name:ident, list) => ( {
                 let name = (stringify!($key_name)).replace("_", "-");
                 obj.find(&name[..]).map(|o| o.as_array()
@@ -276,35 +477,61 @@ impl Target {
                         )
                     );
             } );
+            ($key_name:ident, optional) => ( {
+                let name = (stringify!($key_name)).replace("_", "-");
+                if let Some(o) = obj.find(&name[..]) {
+                    base.options.$key_name = o
+                        .as_string()
+                        .map(|s| s.to_string() );
+                }
+            } );
         }
 
-        key!(cpu);
-        key!(ar);
+        key!(is_builtin, bool);
         key!(linker);
+        key!(ar);
+        key!(pre_link_args, list);
+        key!(pre_link_objects_exe, list);
+        key!(pre_link_objects_dll, list);
+        key!(late_link_args, list);
+        key!(post_link_objects, list);
+        key!(post_link_args, list);
+        key!(cpu);
+        key!(features);
+        key!(dynamic_linking, bool);
+        key!(executables, bool);
         key!(relocation_model);
         key!(code_model);
+        key!(disable_redzone, bool);
+        key!(eliminate_frame_pointer, bool);
+        key!(function_sections, bool);
         key!(dll_prefix);
         key!(dll_suffix);
         key!(exe_suffix);
         key!(staticlib_prefix);
         key!(staticlib_suffix);
-        key!(features);
-        key!(data_layout);
-        key!(dynamic_linking, bool);
-        key!(executables, bool);
-        key!(morestack, bool);
-        key!(disable_redzone, bool);
-        key!(eliminate_frame_pointer, bool);
-        key!(function_sections, bool);
+        key!(target_family, optional);
         key!(is_like_osx, bool);
+        key!(is_like_solaris, bool);
         key!(is_like_windows, bool);
+        key!(is_like_msvc, bool);
+        key!(is_like_android, bool);
         key!(linker_is_gnu, bool);
+        key!(allows_weak_linkage, bool);
         key!(has_rpath, bool);
         key!(no_compiler_rt, bool);
-        key!(pre_link_args, list);
-        key!(post_link_args, list);
+        key!(no_default_libraries, bool);
+        key!(position_independent_executables, bool);
+        key!(archive_format);
+        key!(allow_asm, bool);
+        key!(custom_unwind_resume, bool);
+        key!(lib_allocation_crate);
+        key!(exe_allocation_crate);
+        key!(has_elf_tls, bool);
+        key!(obj_is_bitcode, bool);
+        key!(max_atomic_width, u64);
 
-        base
+        Ok(base)
     }
 
     /// Search RUST_TARGET_PATH for a JSON file specifying the given target
@@ -322,79 +549,17 @@ impl Target {
         use serialize::json;
 
         fn load_file(path: &Path) -> Result<Target, String> {
-            let mut f = try!(File::open(path).map_err(|e| e.to_string()));
+            let mut f = File::open(path).map_err(|e| e.to_string())?;
             let mut contents = Vec::new();
-            try!(f.read_to_end(&mut contents).map_err(|e| e.to_string()));
-            let obj = try!(json::from_reader(&mut &contents[..])
-                                .map_err(|e| e.to_string()));
-            Ok(Target::from_json(obj))
+            f.read_to_end(&mut contents).map_err(|e| e.to_string())?;
+            let obj = json::from_reader(&mut &contents[..])
+                           .map_err(|e| e.to_string())?;
+            Target::from_json(obj)
         }
 
-        // this would use a match if stringify! were allowed in pattern position
-        macro_rules! load_specific {
-            ( $($name:ident),+ ) => (
-                {
-                    $(mod $name;)*
-                    let target = target.replace("-", "_");
-                    if false { }
-                    $(
-                        else if target == stringify!($name) {
-                            let t = $name::target();
-                            debug!("Got builtin target: {:?}", t);
-                            return Ok(t);
-                        }
-                    )*
-                    else if target == "x86_64-w64-mingw32" {
-                        let t = x86_64_pc_windows_gnu::target();
-                        return Ok(t);
-                    } else if target == "i686-w64-mingw32" {
-                        let t = i686_pc_windows_gnu::target();
-                        return Ok(t);
-                    }
-                }
-            )
+        if let Ok(t) = load_specific(target) {
+            return Ok(t)
         }
-
-        load_specific!(
-            x86_64_unknown_linux_gnu,
-            i686_unknown_linux_gnu,
-            mips_unknown_linux_gnu,
-            mipsel_unknown_linux_gnu,
-            powerpc_unknown_linux_gnu,
-            arm_unknown_linux_gnueabi,
-            arm_unknown_linux_gnueabihf,
-            aarch64_unknown_linux_gnu,
-            x86_64_unknown_linux_musl,
-
-            arm_linux_androideabi,
-            aarch64_linux_android,
-
-            i686_unknown_freebsd,
-            x86_64_unknown_freebsd,
-
-            i686_unknown_dragonfly,
-            x86_64_unknown_dragonfly,
-
-            x86_64_unknown_bitrig,
-            x86_64_unknown_openbsd,
-            x86_64_unknown_netbsd,
-
-            x86_64_apple_darwin,
-            i686_apple_darwin,
-
-            i386_apple_ios,
-            x86_64_apple_ios,
-            aarch64_apple_ios,
-            armv7_apple_ios,
-            armv7s_apple_ios,
-
-            x86_64_pc_windows_gnu,
-            i686_pc_windows_gnu,
-
-            x86_64_pc_windows_msvc,
-            i686_pc_windows_msvc
-        );
-
 
         let path = Path::new(target);
 
@@ -421,5 +586,102 @@ impl Target {
         }
 
         Err(format!("Could not find specification for target {:?}", target))
+    }
+}
+
+impl ToJson for Target {
+    fn to_json(&self) -> Json {
+        let mut d = BTreeMap::new();
+        let default: TargetOptions = Default::default();
+
+        macro_rules! target_val {
+            ($attr:ident) => ( {
+                let name = (stringify!($attr)).replace("_", "-");
+                d.insert(name.to_string(), self.$attr.to_json());
+            } );
+            ($attr:ident, $key_name:expr) => ( {
+                let name = $key_name;
+                d.insert(name.to_string(), self.$attr.to_json());
+            } );
+        }
+
+        macro_rules! target_option_val {
+            ($attr:ident) => ( {
+                let name = (stringify!($attr)).replace("_", "-");
+                if default.$attr != self.options.$attr {
+                    d.insert(name.to_string(), self.options.$attr.to_json());
+                }
+            } );
+            ($attr:ident, $key_name:expr) => ( {
+                let name = $key_name;
+                if default.$attr != self.options.$attr {
+                    d.insert(name.to_string(), self.options.$attr.to_json());
+                }
+            } );
+        }
+
+        target_val!(llvm_target);
+        target_val!(target_endian);
+        target_val!(target_pointer_width);
+        target_val!(arch);
+        target_val!(target_os, "os");
+        target_val!(target_env, "env");
+        target_val!(target_vendor, "vendor");
+        target_val!(arch);
+        target_val!(data_layout);
+
+        target_option_val!(is_builtin);
+        target_option_val!(linker);
+        target_option_val!(ar);
+        target_option_val!(pre_link_args);
+        target_option_val!(pre_link_objects_exe);
+        target_option_val!(pre_link_objects_dll);
+        target_option_val!(late_link_args);
+        target_option_val!(post_link_objects);
+        target_option_val!(post_link_args);
+        target_option_val!(cpu);
+        target_option_val!(features);
+        target_option_val!(dynamic_linking);
+        target_option_val!(executables);
+        target_option_val!(relocation_model);
+        target_option_val!(code_model);
+        target_option_val!(disable_redzone);
+        target_option_val!(eliminate_frame_pointer);
+        target_option_val!(function_sections);
+        target_option_val!(dll_prefix);
+        target_option_val!(dll_suffix);
+        target_option_val!(exe_suffix);
+        target_option_val!(staticlib_prefix);
+        target_option_val!(staticlib_suffix);
+        target_option_val!(target_family);
+        target_option_val!(is_like_osx);
+        target_option_val!(is_like_solaris);
+        target_option_val!(is_like_windows);
+        target_option_val!(is_like_msvc);
+        target_option_val!(is_like_android);
+        target_option_val!(linker_is_gnu);
+        target_option_val!(allows_weak_linkage);
+        target_option_val!(has_rpath);
+        target_option_val!(no_compiler_rt);
+        target_option_val!(no_default_libraries);
+        target_option_val!(position_independent_executables);
+        target_option_val!(archive_format);
+        target_option_val!(allow_asm);
+        target_option_val!(custom_unwind_resume);
+        target_option_val!(lib_allocation_crate);
+        target_option_val!(exe_allocation_crate);
+        target_option_val!(has_elf_tls);
+        target_option_val!(obj_is_bitcode);
+        target_option_val!(max_atomic_width);
+
+        Json::Object(d)
+    }
+}
+
+fn maybe_jemalloc() -> String {
+    if cfg!(feature = "jemalloc") {
+        "alloc_jemalloc".to_string()
+    } else {
+        "alloc_system".to_string()
     }
 }

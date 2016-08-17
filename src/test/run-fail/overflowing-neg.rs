@@ -8,12 +8,11 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-// error-pattern:thread '<main>' panicked at 'attempted to negate with overflow'
+// ignore-pretty : (#23623) problems when  ending with // comments
+
+// error-pattern:thread 'main' panicked at 'attempt to negate with overflow'
 // compile-flags: -C debug-assertions
 
-// (Work around constant-evaluation)
-fn value() -> i8 { std::i8::MIN }
-
 fn main() {
-    let _x = -value();
+    let _x = -std::i8::MIN;
 }

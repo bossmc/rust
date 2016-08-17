@@ -12,7 +12,6 @@
 //! normal visitor, which just walks the entire body in one shot, the
 //! `ExprUseVisitor` determines how expressions are being used.
 
-pub use self::MutateMode::*;
 pub use self::LoanCause::*;
 pub use self::ConsumeMode::*;
 pub use self::MoveReason::*;
@@ -20,14 +19,18 @@ pub use self::MatchMode::*;
 use self::TrackMatchMode::*;
 use self::OverloadedCallType::*;
 
-use middle::{def, region, pat_util};
-use middle::infer;
+use hir::pat_util;
+use hir::def::Def;
+use hir::def_id::{DefId};
+use infer::InferCtxt;
 use middle::mem_categorization as mc;
-use middle::ty;
+use ty::{self, TyCtxt, adjustment};
 
-use syntax::{ast, ast_util};
+use hir::{self, PatKind};
+
+use syntax::ast;
 use syntax::ptr::P;
-use syntax::codemap::Span;
+use syntax_pos::Span;
 
 ///////////////////////////////////////////////////////////////////////////
 // The Delegate trait
@@ -56,14 +59,14 @@ pub trait Delegate<'tcx> {
     // same input pattern structure (though of `consume_pat` can be
     // called on a subpart of an input passed to `matched_pat).
     fn matched_pat(&mut self,
-                   matched_pat: &ast::Pat,
+                   matched_pat: &hir::Pat,
                    cmt: mc::cmt<'tcx>,
                    mode: MatchMode);
 
     // The value found at `cmt` is either copied or moved via the
     // pattern binding `consume_pat`, depending on mode.
     fn consume_pat(&mut self,
-                   consume_pat: &ast::Pat,
+                   consume_pat: &hir::Pat,
                    cmt: mc::cmt<'tcx>,
                    mode: ConsumeMode);
 
@@ -206,8 +209,7 @@ enum OverloadedCallType {
 }
 
 impl OverloadedCallType {
-    fn from_trait_id(tcx: &ty::ctxt, trait_id: ast::DefId)
-                     -> OverloadedCallType {
+    fn from_trait_id(tcx: TyCtxt, trait_id: DefId) -> OverloadedCallType {
         for &(maybe_function_trait, overloaded_call_type) in &[
             (tcx.lang_items.fn_once_trait(), FnOnceOverloadedCall),
             (tcx.lang_items.fn_mut_trait(), FnMutOverloadedCall),
@@ -221,11 +223,10 @@ impl OverloadedCallType {
             }
         }
 
-        tcx.sess.bug("overloaded call didn't map to known function trait")
+        bug!("overloaded call didn't map to known function trait")
     }
 
-    fn from_method_id(tcx: &ty::ctxt, method_id: ast::DefId)
-                      -> OverloadedCallType {
+    fn from_method_id(tcx: TyCtxt, method_id: DefId) -> OverloadedCallType {
         let method = tcx.impl_or_trait_item(method_id);
         OverloadedCallType::from_trait_id(tcx, method.container().id())
     }
@@ -238,11 +239,9 @@ impl OverloadedCallType {
 // mem_categorization, it requires a TYPER, which is a type that
 // supplies types from the tree. After type checking is complete, you
 // can just use the tcx as the typer.
-
-pub struct ExprUseVisitor<'d,'t,'a: 't, 'tcx:'a> {
-    typer: &'t infer::InferCtxt<'a, 'tcx>,
-    mc: mc::MemCategorizationContext<'t, 'a, 'tcx>,
-    delegate: &'d mut (Delegate<'tcx>+'d),
+pub struct ExprUseVisitor<'a, 'gcx: 'a+'tcx, 'tcx: 'a> {
+    mc: mc::MemCategorizationContext<'a, 'gcx, 'tcx>,
+    delegate: &'a mut Delegate<'tcx>,
 }
 
 // If the TYPER results in an error, it's because the type check
@@ -256,7 +255,10 @@ macro_rules! return_if_err {
     ($inp: expr) => (
         match $inp {
             Ok(v) => v,
-            Err(()) => return
+            Err(()) => {
+                debug!("mc reported err");
+                return
+            }
         }
     )
 }
@@ -267,43 +269,51 @@ enum PassArgs {
     ByRef,
 }
 
-impl<'d,'t,'a,'tcx> ExprUseVisitor<'d,'t,'a,'tcx> {
-    pub fn new(delegate: &'d mut Delegate<'tcx>,
-               typer: &'t infer::InferCtxt<'a, 'tcx>)
-               -> ExprUseVisitor<'d,'t,'a, 'tcx> {
+impl<'a, 'gcx, 'tcx> ExprUseVisitor<'a, 'gcx, 'tcx> {
+    pub fn new(delegate: &'a mut (Delegate<'tcx>+'a),
+               infcx: &'a InferCtxt<'a, 'gcx, 'tcx>)
+               -> Self
+    {
+        ExprUseVisitor::with_options(delegate, infcx, mc::MemCategorizationOptions::default())
+    }
+
+    pub fn with_options(delegate: &'a mut (Delegate<'tcx>+'a),
+                        infcx: &'a InferCtxt<'a, 'gcx, 'tcx>,
+                        options: mc::MemCategorizationOptions)
+               -> Self
+    {
         ExprUseVisitor {
-            typer: typer,
-            mc: mc::MemCategorizationContext::new(typer),
-            delegate: delegate,
+            mc: mc::MemCategorizationContext::with_options(infcx, options),
+            delegate: delegate
         }
     }
 
     pub fn walk_fn(&mut self,
-                   decl: &ast::FnDecl,
-                   body: &ast::Block) {
+                   decl: &hir::FnDecl,
+                   body: &hir::Block) {
         self.walk_arg_patterns(decl, body);
         self.walk_block(body);
     }
 
     fn walk_arg_patterns(&mut self,
-                         decl: &ast::FnDecl,
-                         body: &ast::Block) {
+                         decl: &hir::FnDecl,
+                         body: &hir::Block) {
         for arg in &decl.inputs {
-            let arg_ty = return_if_err!(self.typer.node_ty(arg.pat.id));
+            let arg_ty = return_if_err!(self.mc.infcx.node_ty(arg.pat.id));
 
-            let fn_body_scope = region::CodeExtent::from_node_id(body.id);
+            let fn_body_scope = self.tcx().region_maps.node_extent(body.id);
             let arg_cmt = self.mc.cat_rvalue(
                 arg.id,
                 arg.pat.span,
                 ty::ReScope(fn_body_scope), // Args live only as long as the fn body.
                 arg_ty);
 
-            self.walk_irrefutable_pat(arg_cmt, &*arg.pat);
+            self.walk_irrefutable_pat(arg_cmt, &arg.pat);
         }
     }
 
-    fn tcx(&self) -> &'t ty::ctxt<'tcx> {
-        self.typer.tcx
+    fn tcx(&self) -> TyCtxt<'a, 'gcx, 'tcx> {
+        self.mc.infcx.tcx
     }
 
     fn delegate_consume(&mut self,
@@ -313,17 +323,17 @@ impl<'d,'t,'a,'tcx> ExprUseVisitor<'d,'t,'a,'tcx> {
         debug!("delegate_consume(consume_id={}, cmt={:?})",
                consume_id, cmt);
 
-        let mode = copy_or_move(self.typer, &cmt, DirectRefMove);
+        let mode = copy_or_move(self.mc.infcx, &cmt, DirectRefMove);
         self.delegate.consume(consume_id, consume_span, cmt, mode);
     }
 
-    fn consume_exprs(&mut self, exprs: &Vec<P<ast::Expr>>) {
+    fn consume_exprs(&mut self, exprs: &[P<hir::Expr>]) {
         for expr in exprs {
-            self.consume_expr(&**expr);
+            self.consume_expr(&expr);
         }
     }
 
-    pub fn consume_expr(&mut self, expr: &ast::Expr) {
+    pub fn consume_expr(&mut self, expr: &hir::Expr) {
         debug!("consume_expr(expr={:?})", expr);
 
         let cmt = return_if_err!(self.mc.cat_expr(expr));
@@ -332,8 +342,8 @@ impl<'d,'t,'a,'tcx> ExprUseVisitor<'d,'t,'a,'tcx> {
     }
 
     fn mutate_expr(&mut self,
-                   assignment_expr: &ast::Expr,
-                   expr: &ast::Expr,
+                   assignment_expr: &hir::Expr,
+                   expr: &hir::Expr,
                    mode: MutateMode) {
         let cmt = return_if_err!(self.mc.cat_expr(expr));
         self.delegate.mutate(assignment_expr.id, assignment_expr.span, cmt, mode);
@@ -341,7 +351,7 @@ impl<'d,'t,'a,'tcx> ExprUseVisitor<'d,'t,'a,'tcx> {
     }
 
     fn borrow_expr(&mut self,
-                   expr: &ast::Expr,
+                   expr: &hir::Expr,
                    r: ty::Region,
                    bk: ty::BorrowKind,
                    cause: LoanCause) {
@@ -351,89 +361,77 @@ impl<'d,'t,'a,'tcx> ExprUseVisitor<'d,'t,'a,'tcx> {
         let cmt = return_if_err!(self.mc.cat_expr(expr));
         self.delegate.borrow(expr.id, expr.span, cmt, r, bk, cause);
 
-        // Note: Unlike consume, we can ignore ExprParen. cat_expr
-        // already skips over them, and walk will uncover any
-        // attachments or whatever.
         self.walk_expr(expr)
     }
 
-    fn select_from_expr(&mut self, expr: &ast::Expr) {
+    fn select_from_expr(&mut self, expr: &hir::Expr) {
         self.walk_expr(expr)
     }
 
-    pub fn walk_expr(&mut self, expr: &ast::Expr) {
+    pub fn walk_expr(&mut self, expr: &hir::Expr) {
         debug!("walk_expr(expr={:?})", expr);
 
         self.walk_adjustment(expr);
 
         match expr.node {
-            ast::ExprParen(ref subexpr) => {
-                self.walk_expr(&**subexpr)
+            hir::ExprPath(..) => { }
+
+            hir::ExprType(ref subexpr, _) => {
+                self.walk_expr(&subexpr)
             }
 
-            ast::ExprPath(..) => { }
-
-            ast::ExprUnary(ast::UnDeref, ref base) => {      // *base
-                if !self.walk_overloaded_operator(expr, &**base, Vec::new(), PassArgs::ByRef) {
-                    self.select_from_expr(&**base);
+            hir::ExprUnary(hir::UnDeref, ref base) => {      // *base
+                if !self.walk_overloaded_operator(expr, &base, Vec::new(), PassArgs::ByRef) {
+                    self.select_from_expr(&base);
                 }
             }
 
-            ast::ExprField(ref base, _) => {         // base.f
-                self.select_from_expr(&**base);
+            hir::ExprField(ref base, _) => {         // base.f
+                self.select_from_expr(&base);
             }
 
-            ast::ExprTupField(ref base, _) => {         // base.<n>
-                self.select_from_expr(&**base);
+            hir::ExprTupField(ref base, _) => {         // base.<n>
+                self.select_from_expr(&base);
             }
 
-            ast::ExprIndex(ref lhs, ref rhs) => {       // lhs[rhs]
+            hir::ExprIndex(ref lhs, ref rhs) => {       // lhs[rhs]
                 if !self.walk_overloaded_operator(expr,
-                                                  &**lhs,
-                                                  vec![&**rhs],
+                                                  &lhs,
+                                                  vec![&rhs],
                                                   PassArgs::ByValue) {
-                    self.select_from_expr(&**lhs);
-                    self.consume_expr(&**rhs);
+                    self.select_from_expr(&lhs);
+                    self.consume_expr(&rhs);
                 }
             }
 
-            ast::ExprRange(ref start, ref end) => {
-                start.as_ref().map(|e| self.consume_expr(&**e));
-                end.as_ref().map(|e| self.consume_expr(&**e));
-            }
-
-            ast::ExprCall(ref callee, ref args) => {    // callee(args)
-                self.walk_callee(expr, &**callee);
+            hir::ExprCall(ref callee, ref args) => {    // callee(args)
+                self.walk_callee(expr, &callee);
                 self.consume_exprs(args);
             }
 
-            ast::ExprMethodCall(_, _, ref args) => { // callee.m(args)
+            hir::ExprMethodCall(_, _, ref args) => { // callee.m(args)
                 self.consume_exprs(args);
             }
 
-            ast::ExprStruct(_, ref fields, ref opt_with) => {
+            hir::ExprStruct(_, ref fields, ref opt_with) => {
                 self.walk_struct_expr(expr, fields, opt_with);
             }
 
-            ast::ExprTup(ref exprs) => {
+            hir::ExprTup(ref exprs) => {
                 self.consume_exprs(exprs);
             }
 
-            ast::ExprIf(ref cond_expr, ref then_blk, ref opt_else_expr) => {
-                self.consume_expr(&**cond_expr);
-                self.walk_block(&**then_blk);
+            hir::ExprIf(ref cond_expr, ref then_blk, ref opt_else_expr) => {
+                self.consume_expr(&cond_expr);
+                self.walk_block(&then_blk);
                 if let Some(ref else_expr) = *opt_else_expr {
-                    self.consume_expr(&**else_expr);
+                    self.consume_expr(&else_expr);
                 }
             }
 
-            ast::ExprIfLet(..) => {
-                self.tcx().sess.span_bug(expr.span, "non-desugared ExprIfLet");
-            }
-
-            ast::ExprMatch(ref discr, ref arms, _) => {
-                let discr_cmt = return_if_err!(self.mc.cat_expr(&**discr));
-                self.borrow_expr(&**discr, ty::ReEmpty, ty::ImmBorrow, MatchDiscriminant);
+            hir::ExprMatch(ref discr, ref arms, _) => {
+                let discr_cmt = return_if_err!(self.mc.cat_expr(&discr));
+                self.borrow_expr(&discr, ty::ReEmpty, ty::ImmBorrow, MatchDiscriminant);
 
                 // treatment of the discriminant is handled while walking the arms.
                 for arm in arms {
@@ -443,148 +441,139 @@ impl<'d,'t,'a,'tcx> ExprUseVisitor<'d,'t,'a,'tcx> {
                 }
             }
 
-            ast::ExprVec(ref exprs) => {
+            hir::ExprVec(ref exprs) => {
                 self.consume_exprs(exprs);
             }
 
-            ast::ExprAddrOf(m, ref base) => {   // &base
+            hir::ExprAddrOf(m, ref base) => {   // &base
                 // make sure that the thing we are pointing out stays valid
                 // for the lifetime `scope_r` of the resulting ptr:
-                let expr_ty = return_if_err!(self.typer.node_ty(expr.id));
+                let expr_ty = return_if_err!(self.mc.infcx.node_ty(expr.id));
                 if let ty::TyRef(&r, _) = expr_ty.sty {
                     let bk = ty::BorrowKind::from_mutbl(m);
-                    self.borrow_expr(&**base, r, bk, AddrOf);
+                    self.borrow_expr(&base, r, bk, AddrOf);
                 }
             }
 
-            ast::ExprInlineAsm(ref ia) => {
-                for &(_, ref input) in &ia.inputs {
-                    self.consume_expr(&**input);
+            hir::ExprInlineAsm(ref ia, ref outputs, ref inputs) => {
+                for (o, output) in ia.outputs.iter().zip(outputs) {
+                    if o.is_indirect {
+                        self.consume_expr(output);
+                    } else {
+                        self.mutate_expr(expr, output,
+                                         if o.is_rw {
+                                             MutateMode::WriteAndRead
+                                         } else {
+                                             MutateMode::JustWrite
+                                         });
+                    }
                 }
-
-                for &(_, ref output, is_rw) in &ia.outputs {
-                    self.mutate_expr(expr, &**output,
-                                           if is_rw { WriteAndRead } else { JustWrite });
-                }
+                self.consume_exprs(inputs);
             }
 
-            ast::ExprBreak(..) |
-            ast::ExprAgain(..) |
-            ast::ExprLit(..) => {}
+            hir::ExprBreak(..) |
+            hir::ExprAgain(..) |
+            hir::ExprLit(..) => {}
 
-            ast::ExprLoop(ref blk, _) => {
-                self.walk_block(&**blk);
+            hir::ExprLoop(ref blk, _) => {
+                self.walk_block(&blk);
             }
 
-            ast::ExprWhile(ref cond_expr, ref blk, _) => {
-                self.consume_expr(&**cond_expr);
-                self.walk_block(&**blk);
+            hir::ExprWhile(ref cond_expr, ref blk, _) => {
+                self.consume_expr(&cond_expr);
+                self.walk_block(&blk);
             }
 
-            ast::ExprWhileLet(..) => {
-                self.tcx().sess.span_bug(expr.span, "non-desugared ExprWhileLet");
-            }
-
-            ast::ExprForLoop(..) => {
-                self.tcx().sess.span_bug(expr.span, "non-desugared ExprForLoop");
-            }
-
-            ast::ExprUnary(op, ref lhs) => {
-                let pass_args = if ast_util::is_by_value_unop(op) {
+            hir::ExprUnary(op, ref lhs) => {
+                let pass_args = if op.is_by_value() {
                     PassArgs::ByValue
                 } else {
                     PassArgs::ByRef
                 };
 
-                if !self.walk_overloaded_operator(expr, &**lhs, Vec::new(), pass_args) {
-                    self.consume_expr(&**lhs);
+                if !self.walk_overloaded_operator(expr, &lhs, Vec::new(), pass_args) {
+                    self.consume_expr(&lhs);
                 }
             }
 
-            ast::ExprBinary(op, ref lhs, ref rhs) => {
-                let pass_args = if ast_util::is_by_value_binop(op.node) {
+            hir::ExprBinary(op, ref lhs, ref rhs) => {
+                let pass_args = if op.node.is_by_value() {
                     PassArgs::ByValue
                 } else {
                     PassArgs::ByRef
                 };
 
-                if !self.walk_overloaded_operator(expr, &**lhs, vec![&**rhs], pass_args) {
-                    self.consume_expr(&**lhs);
-                    self.consume_expr(&**rhs);
+                if !self.walk_overloaded_operator(expr, &lhs, vec![&rhs], pass_args) {
+                    self.consume_expr(&lhs);
+                    self.consume_expr(&rhs);
                 }
             }
 
-            ast::ExprBlock(ref blk) => {
-                self.walk_block(&**blk);
+            hir::ExprBlock(ref blk) => {
+                self.walk_block(&blk);
             }
 
-            ast::ExprRet(ref opt_expr) => {
+            hir::ExprRet(ref opt_expr) => {
                 if let Some(ref expr) = *opt_expr {
-                    self.consume_expr(&**expr);
+                    self.consume_expr(&expr);
                 }
             }
 
-            ast::ExprAssign(ref lhs, ref rhs) => {
-                self.mutate_expr(expr, &**lhs, JustWrite);
-                self.consume_expr(&**rhs);
+            hir::ExprAssign(ref lhs, ref rhs) => {
+                self.mutate_expr(expr, &lhs, MutateMode::JustWrite);
+                self.consume_expr(&rhs);
             }
 
-            ast::ExprCast(ref base, _) => {
-                self.consume_expr(&**base);
+            hir::ExprCast(ref base, _) => {
+                self.consume_expr(&base);
             }
 
-            ast::ExprAssignOp(_, ref lhs, ref rhs) => {
-                // This will have to change if/when we support
-                // overloaded operators for `+=` and so forth.
-                self.mutate_expr(expr, &**lhs, WriteAndRead);
-                self.consume_expr(&**rhs);
-            }
+            hir::ExprAssignOp(op, ref lhs, ref rhs) => {
+                // NB All our assignment operations take the RHS by value
+                assert!(op.node.is_by_value());
 
-            ast::ExprRepeat(ref base, ref count) => {
-                self.consume_expr(&**base);
-                self.consume_expr(&**count);
-            }
-
-            ast::ExprClosure(..) => {
-                self.walk_captures(expr)
-            }
-
-            ast::ExprBox(ref place, ref base) => {
-                match *place {
-                    Some(ref place) => self.consume_expr(&**place),
-                    None => {}
+                if !self.walk_overloaded_operator(expr, lhs, vec![rhs], PassArgs::ByValue) {
+                    self.mutate_expr(expr, &lhs, MutateMode::WriteAndRead);
+                    self.consume_expr(&rhs);
                 }
-                self.consume_expr(&**base);
             }
 
-            ast::ExprMac(..) => {
-                self.tcx().sess.span_bug(
-                    expr.span,
-                    "macro expression remains after expansion");
+            hir::ExprRepeat(ref base, ref count) => {
+                self.consume_expr(&base);
+                self.consume_expr(&count);
+            }
+
+            hir::ExprClosure(_, _, _, fn_decl_span) => {
+                self.walk_captures(expr, fn_decl_span)
+            }
+
+            hir::ExprBox(ref base) => {
+                self.consume_expr(&base);
             }
         }
     }
 
-    fn walk_callee(&mut self, call: &ast::Expr, callee: &ast::Expr) {
-        let callee_ty = return_if_err!(self.typer.expr_ty_adjusted(callee));
+    fn walk_callee(&mut self, call: &hir::Expr, callee: &hir::Expr) {
+        let callee_ty = return_if_err!(self.mc.infcx.expr_ty_adjusted(callee));
         debug!("walk_callee: callee={:?} callee_ty={:?}",
                callee, callee_ty);
-        let call_scope = region::CodeExtent::from_node_id(call.id);
+        let call_scope = self.tcx().region_maps.node_extent(call.id);
         match callee_ty.sty {
-            ty::TyBareFn(..) => {
+            ty::TyFnDef(..) | ty::TyFnPtr(_) => {
                 self.consume_expr(callee);
             }
             ty::TyError => { }
             _ => {
                 let overloaded_call_type =
-                    match self.typer.node_method_id(ty::MethodCall::expr(call.id)) {
+                    match self.mc.infcx.node_method_id(ty::MethodCall::expr(call.id)) {
                         Some(method_id) => {
                             OverloadedCallType::from_method_id(self.tcx(), method_id)
                         }
                         None => {
-                            self.tcx().sess.span_bug(
+                            span_bug!(
                                 callee.span,
-                                &format!("unexpected callee type {}", callee_ty))
+                                "unexpected callee type {}",
+                                callee_ty)
                         }
                     };
                 match overloaded_call_type {
@@ -606,38 +595,33 @@ impl<'d,'t,'a,'tcx> ExprUseVisitor<'d,'t,'a,'tcx> {
         }
     }
 
-    fn walk_stmt(&mut self, stmt: &ast::Stmt) {
+    fn walk_stmt(&mut self, stmt: &hir::Stmt) {
         match stmt.node {
-            ast::StmtDecl(ref decl, _) => {
+            hir::StmtDecl(ref decl, _) => {
                 match decl.node {
-                    ast::DeclLocal(ref local) => {
-                        self.walk_local(&**local);
+                    hir::DeclLocal(ref local) => {
+                        self.walk_local(&local);
                     }
 
-                    ast::DeclItem(_) => {
+                    hir::DeclItem(_) => {
                         // we don't visit nested items in this visitor,
                         // only the fn body we were given.
                     }
                 }
             }
 
-            ast::StmtExpr(ref expr, _) |
-            ast::StmtSemi(ref expr, _) => {
-                self.consume_expr(&**expr);
-            }
-
-            ast::StmtMac(..) => {
-                self.tcx().sess.span_bug(stmt.span, "unexpanded stmt macro");
+            hir::StmtExpr(ref expr, _) |
+            hir::StmtSemi(ref expr, _) => {
+                self.consume_expr(&expr);
             }
         }
     }
 
-    fn walk_local(&mut self, local: &ast::Local) {
+    fn walk_local(&mut self, local: &hir::Local) {
         match local.init {
             None => {
                 let delegate = &mut self.delegate;
-                pat_util::pat_bindings(&self.typer.tcx.def_map, &*local.pat,
-                                       |_, id, span, _| {
+                pat_util::pat_bindings(&local.pat, |_, id, span, _| {
                     delegate.decl_without_init(id, span);
                 })
             }
@@ -647,34 +631,34 @@ impl<'d,'t,'a,'tcx> ExprUseVisitor<'d,'t,'a,'tcx> {
                 // initializers are considered
                 // "assigns", which is handled by
                 // `walk_pat`:
-                self.walk_expr(&**expr);
-                let init_cmt = return_if_err!(self.mc.cat_expr(&**expr));
-                self.walk_irrefutable_pat(init_cmt, &*local.pat);
+                self.walk_expr(&expr);
+                let init_cmt = return_if_err!(self.mc.cat_expr(&expr));
+                self.walk_irrefutable_pat(init_cmt, &local.pat);
             }
         }
     }
 
     /// Indicates that the value of `blk` will be consumed, meaning either copied or moved
     /// depending on its type.
-    fn walk_block(&mut self, blk: &ast::Block) {
+    fn walk_block(&mut self, blk: &hir::Block) {
         debug!("walk_block(blk.id={})", blk.id);
 
         for stmt in &blk.stmts {
-            self.walk_stmt(&**stmt);
+            self.walk_stmt(stmt);
         }
 
         if let Some(ref tail_expr) = blk.expr {
-            self.consume_expr(&**tail_expr);
+            self.consume_expr(&tail_expr);
         }
     }
 
     fn walk_struct_expr(&mut self,
-                        _expr: &ast::Expr,
-                        fields: &Vec<ast::Field>,
-                        opt_with: &Option<P<ast::Expr>>) {
+                        _expr: &hir::Expr,
+                        fields: &[hir::Field],
+                        opt_with: &Option<P<hir::Expr>>) {
         // Consume the expressions supplying values for each field.
         for field in fields {
-            self.consume_expr(&*field.expr);
+            self.consume_expr(&field.expr);
         }
 
         let with_expr = match *opt_with {
@@ -682,72 +666,69 @@ impl<'d,'t,'a,'tcx> ExprUseVisitor<'d,'t,'a,'tcx> {
             None => { return; }
         };
 
-        let with_cmt = return_if_err!(self.mc.cat_expr(&*with_expr));
+        let with_cmt = return_if_err!(self.mc.cat_expr(&with_expr));
 
         // Select just those fields of the `with`
         // expression that will actually be used
-        let with_fields = match with_cmt.ty.sty {
-            ty::TyStruct(did, substs) => {
-                self.tcx().struct_fields(did, substs)
-            }
-            _ => {
-                // the base expression should always evaluate to a
-                // struct; however, when EUV is run during typeck, it
-                // may not. This will generate an error earlier in typeck,
-                // so we can just ignore it.
-                if !self.tcx().sess.has_errors() {
-                    self.tcx().sess.span_bug(
-                        with_expr.span,
-                        "with expression doesn't evaluate to a struct");
+        if let ty::TyStruct(def, substs) = with_cmt.ty.sty {
+            // Consume those fields of the with expression that are needed.
+            for with_field in &def.struct_variant().fields {
+                if !contains_field_named(with_field, fields) {
+                    let cmt_field = self.mc.cat_field(
+                        &*with_expr,
+                        with_cmt.clone(),
+                        with_field.name,
+                        with_field.ty(self.tcx(), substs)
+                    );
+                    self.delegate_consume(with_expr.id, with_expr.span, cmt_field);
                 }
-                assert!(self.tcx().sess.has_errors());
-                vec!()
+            }
+        } else {
+            // the base expression should always evaluate to a
+            // struct; however, when EUV is run during typeck, it
+            // may not. This will generate an error earlier in typeck,
+            // so we can just ignore it.
+            if !self.tcx().sess.has_errors() {
+                span_bug!(
+                    with_expr.span,
+                    "with expression doesn't evaluate to a struct");
             }
         };
-
-        // Consume those fields of the with expression that are needed.
-        for with_field in &with_fields {
-            if !contains_field_named(with_field, fields) {
-                let cmt_field = self.mc.cat_field(&*with_expr,
-                                                  with_cmt.clone(),
-                                                  with_field.name,
-                                                  with_field.mt.ty);
-                self.delegate_consume(with_expr.id, with_expr.span, cmt_field);
-            }
-        }
 
         // walk the with expression so that complex expressions
         // are properly handled.
         self.walk_expr(with_expr);
 
-        fn contains_field_named(field: &ty::Field,
-                                fields: &Vec<ast::Field>)
+        fn contains_field_named(field: ty::FieldDef,
+                                fields: &[hir::Field])
                                 -> bool
         {
             fields.iter().any(
-                |f| f.ident.node.name == field.name)
+                |f| f.name.node == field.name)
         }
     }
 
     // Invoke the appropriate delegate calls for anything that gets
     // consumed or borrowed as part of the automatic adjustment
     // process.
-    fn walk_adjustment(&mut self, expr: &ast::Expr) {
-        let typer = self.typer;
+    fn walk_adjustment(&mut self, expr: &hir::Expr) {
+        let infcx = self.mc.infcx;
         //NOTE(@jroesch): mixed RefCell borrow causes crash
-        let adj = typer.adjustments().get(&expr.id).map(|x| x.clone());
+        let adj = infcx.adjustments().get(&expr.id).map(|x| x.clone());
         if let Some(adjustment) = adj {
             match adjustment {
-                ty::AdjustReifyFnPointer |
-                ty::AdjustUnsafeFnPointer => {
+                adjustment::AdjustNeverToAny(..) |
+                adjustment::AdjustReifyFnPointer |
+                adjustment::AdjustUnsafeFnPointer |
+                adjustment::AdjustMutToConstPointer => {
                     // Creating a closure/fn-pointer or unsizing consumes
                     // the input and stores it into the resulting rvalue.
-                    debug!("walk_adjustment(AdjustReifyFnPointer|AdjustUnsafeFnPointer)");
+                    debug!("walk_adjustment: trivial adjustment");
                     let cmt_unadjusted =
                         return_if_err!(self.mc.cat_expr_unadjusted(expr));
                     self.delegate_consume(expr.id, expr.span, cmt_unadjusted);
                 }
-                ty::AdjustDerefRef(ref adj) => {
+                adjustment::AdjustDerefRef(ref adj) => {
                     self.walk_autoderefref(expr, adj);
                 }
             }
@@ -758,39 +739,36 @@ impl<'d,'t,'a,'tcx> ExprUseVisitor<'d,'t,'a,'tcx> {
     /// `(*x)` where `x` is of type `Rc<T>`, then this in fact is equivalent to `x.deref()`. Since
     /// `deref()` is declared with `&self`, this is an autoref of `x`.
     fn walk_autoderefs(&mut self,
-                       expr: &ast::Expr,
+                       expr: &hir::Expr,
                        autoderefs: usize) {
         debug!("walk_autoderefs expr={:?} autoderefs={}", expr, autoderefs);
 
         for i in 0..autoderefs {
             let deref_id = ty::MethodCall::autoderef(expr.id, i as u32);
-            match self.typer.node_method_ty(deref_id) {
-                None => {}
-                Some(method_ty) => {
-                    let cmt = return_if_err!(self.mc.cat_expr_autoderefd(expr, i));
+            if let Some(method_ty) = self.mc.infcx.node_method_ty(deref_id) {
+                let cmt = return_if_err!(self.mc.cat_expr_autoderefd(expr, i));
 
-                    // the method call infrastructure should have
-                    // replaced all late-bound regions with variables:
-                    let self_ty = method_ty.fn_sig().input(0);
-                    let self_ty = self.tcx().no_late_bound_regions(&self_ty).unwrap();
+                // the method call infrastructure should have
+                // replaced all late-bound regions with variables:
+                let self_ty = method_ty.fn_sig().input(0);
+                let self_ty = self.tcx().no_late_bound_regions(&self_ty).unwrap();
 
-                    let (m, r) = match self_ty.sty {
-                        ty::TyRef(r, ref m) => (m.mutbl, r),
-                        _ => self.tcx().sess.span_bug(expr.span,
-                                &format!("bad overloaded deref type {:?}",
-                                    method_ty))
-                    };
-                    let bk = ty::BorrowKind::from_mutbl(m);
-                    self.delegate.borrow(expr.id, expr.span, cmt,
-                                         *r, bk, AutoRef);
-                }
+                let (m, r) = match self_ty.sty {
+                    ty::TyRef(r, ref m) => (m.mutbl, r),
+                    _ => span_bug!(expr.span,
+                                   "bad overloaded deref type {:?}",
+                                   method_ty)
+                };
+                let bk = ty::BorrowKind::from_mutbl(m);
+                self.delegate.borrow(expr.id, expr.span, cmt,
+                                     *r, bk, AutoRef);
             }
         }
     }
 
     fn walk_autoderefref(&mut self,
-                         expr: &ast::Expr,
-                         adj: &ty::AutoDerefRef<'tcx>) {
+                         expr: &hir::Expr,
+                         adj: &adjustment::AutoDerefRef<'tcx>) {
         debug!("walk_autoderefref expr={:?} adj={:?}",
                expr,
                adj);
@@ -819,9 +797,9 @@ impl<'d,'t,'a,'tcx> ExprUseVisitor<'d,'t,'a,'tcx> {
     /// `cmt` for the rvalue that will be produced by introduced an
     /// autoref.
     fn walk_autoref(&mut self,
-                    expr: &ast::Expr,
+                    expr: &hir::Expr,
                     cmt_base: mc::cmt<'tcx>,
-                    opt_autoref: Option<ty::AutoRef<'tcx>>)
+                    opt_autoref: Option<adjustment::AutoRef<'tcx>>)
                     -> mc::cmt<'tcx>
     {
         debug!("walk_autoref(expr.id={} cmt_derefd={:?} opt_autoref={:?})",
@@ -840,7 +818,7 @@ impl<'d,'t,'a,'tcx> ExprUseVisitor<'d,'t,'a,'tcx> {
         };
 
         match *autoref {
-            ty::AutoPtr(r, m) => {
+            adjustment::AutoPtr(r, m) => {
                 self.delegate.borrow(expr.id,
                                      expr.span,
                                      cmt_base,
@@ -849,7 +827,7 @@ impl<'d,'t,'a,'tcx> ExprUseVisitor<'d,'t,'a,'tcx> {
                                      AutoRef);
             }
 
-            ty::AutoUnsafe(m) => {
+            adjustment::AutoUnsafe(m) => {
                 debug!("walk_autoref: expr.id={} cmt_base={:?}",
                        expr.id,
                        cmt_base);
@@ -857,7 +835,7 @@ impl<'d,'t,'a,'tcx> ExprUseVisitor<'d,'t,'a,'tcx> {
                 // Converting from a &T to *T (or &mut T to *mut T) is
                 // treated as borrowing it for the enclosing temporary
                 // scope.
-                let r = ty::ReScope(region::CodeExtent::from_node_id(expr.id));
+                let r = ty::ReScope(self.tcx().region_maps.node_extent(expr.id));
 
                 self.delegate.borrow(expr.id,
                                      expr.span,
@@ -884,13 +862,13 @@ impl<'d,'t,'a,'tcx> ExprUseVisitor<'d,'t,'a,'tcx> {
     // recursively processing the input arguments, and thus the caller
     // should not do so.
     fn walk_overloaded_operator(&mut self,
-                                expr: &ast::Expr,
-                                receiver: &ast::Expr,
-                                rhs: Vec<&ast::Expr>,
+                                expr: &hir::Expr,
+                                receiver: &hir::Expr,
+                                rhs: Vec<&hir::Expr>,
                                 pass_args: PassArgs)
                                 -> bool
     {
-        if !self.typer.is_method_call(expr.id) {
+        if !self.mc.infcx.is_method_call(expr.id) {
             return false;
         }
 
@@ -912,7 +890,7 @@ impl<'d,'t,'a,'tcx> ExprUseVisitor<'d,'t,'a,'tcx> {
         // methods are implicitly autoref'd which sadly does not use
         // adjustments, so we must hardcode the borrow here.
 
-        let r = ty::ReScope(region::CodeExtent::from_node_id(expr.id));
+        let r = ty::ReScope(self.tcx().region_maps.node_extent(expr.id));
         let bk = ty::ImmBorrow;
 
         for &arg in &rhs {
@@ -921,29 +899,29 @@ impl<'d,'t,'a,'tcx> ExprUseVisitor<'d,'t,'a,'tcx> {
         return true;
     }
 
-    fn arm_move_mode(&mut self, discr_cmt: mc::cmt<'tcx>, arm: &ast::Arm) -> TrackMatchMode {
+    fn arm_move_mode(&mut self, discr_cmt: mc::cmt<'tcx>, arm: &hir::Arm) -> TrackMatchMode {
         let mut mode = Unknown;
         for pat in &arm.pats {
-            self.determine_pat_move_mode(discr_cmt.clone(), &**pat, &mut mode);
+            self.determine_pat_move_mode(discr_cmt.clone(), &pat, &mut mode);
         }
         mode
     }
 
-    fn walk_arm(&mut self, discr_cmt: mc::cmt<'tcx>, arm: &ast::Arm, mode: MatchMode) {
+    fn walk_arm(&mut self, discr_cmt: mc::cmt<'tcx>, arm: &hir::Arm, mode: MatchMode) {
         for pat in &arm.pats {
-            self.walk_pat(discr_cmt.clone(), &**pat, mode);
+            self.walk_pat(discr_cmt.clone(), &pat, mode);
         }
 
         if let Some(ref guard) = arm.guard {
-            self.consume_expr(&**guard);
+            self.consume_expr(&guard);
         }
 
-        self.consume_expr(&*arm.body);
+        self.consume_expr(&arm.body);
     }
 
-    /// Walks an pat that occurs in isolation (i.e. top-level of fn
+    /// Walks a pat that occurs in isolation (i.e. top-level of fn
     /// arg or let binding.  *Not* a match arm or nested pat.)
-    fn walk_irrefutable_pat(&mut self, cmt_discr: mc::cmt<'tcx>, pat: &ast::Pat) {
+    fn walk_irrefutable_pat(&mut self, cmt_discr: mc::cmt<'tcx>, pat: &hir::Pat) {
         let mut mode = Unknown;
         self.determine_pat_move_mode(cmt_discr.clone(), pat, &mut mode);
         let mode = mode.match_mode();
@@ -955,29 +933,21 @@ impl<'d,'t,'a,'tcx> ExprUseVisitor<'d,'t,'a,'tcx> {
     /// copy, or borrow.
     fn determine_pat_move_mode(&mut self,
                                cmt_discr: mc::cmt<'tcx>,
-                               pat: &ast::Pat,
+                               pat: &hir::Pat,
                                mode: &mut TrackMatchMode) {
         debug!("determine_pat_move_mode cmt_discr={:?} pat={:?}", cmt_discr,
                pat);
         return_if_err!(self.mc.cat_pattern(cmt_discr, pat, |_mc, cmt_pat, pat| {
-            let tcx = self.tcx();
-            let def_map = &self.tcx().def_map;
-            if pat_util::pat_is_binding(def_map, pat) {
-                match pat.node {
-                    ast::PatIdent(ast::BindByRef(_), _, _) =>
-                        mode.lub(BorrowingMatch),
-                    ast::PatIdent(ast::BindByValue(_), _, _) => {
-                        match copy_or_move(self.typer, &cmt_pat, PatBindingMove) {
-                            Copy => mode.lub(CopyingMatch),
-                            Move(_) => mode.lub(MovingMatch),
-                        }
-                    }
-                    _ => {
-                        tcx.sess.span_bug(
-                            pat.span,
-                            "binding pattern not an identifier");
+            match pat.node {
+                PatKind::Binding(hir::BindByRef(..), _, _) =>
+                    mode.lub(BorrowingMatch),
+                PatKind::Binding(hir::BindByValue(..), _, _) => {
+                    match copy_or_move(self.mc.infcx, &cmt_pat, PatBindingMove) {
+                        Copy => mode.lub(CopyingMatch),
+                        Move(..) => mode.lub(MovingMatch),
                     }
                 }
+                _ => {}
             }
         }));
     }
@@ -985,96 +955,40 @@ impl<'d,'t,'a,'tcx> ExprUseVisitor<'d,'t,'a,'tcx> {
     /// The core driver for walking a pattern; `match_mode` must be
     /// established up front, e.g. via `determine_pat_move_mode` (see
     /// also `walk_irrefutable_pat` for patterns that stand alone).
-    fn walk_pat(&mut self,
-                cmt_discr: mc::cmt<'tcx>,
-                pat: &ast::Pat,
-                match_mode: MatchMode) {
-        debug!("walk_pat cmt_discr={:?} pat={:?}", cmt_discr,
-               pat);
+    fn walk_pat(&mut self, cmt_discr: mc::cmt<'tcx>, pat: &hir::Pat, match_mode: MatchMode) {
+        debug!("walk_pat cmt_discr={:?} pat={:?}", cmt_discr, pat);
 
+        let tcx = &self.tcx();
         let mc = &self.mc;
-        let typer = self.typer;
-        let def_map = &self.tcx().def_map;
+        let infcx = self.mc.infcx;
         let delegate = &mut self.delegate;
         return_if_err!(mc.cat_pattern(cmt_discr.clone(), pat, |mc, cmt_pat, pat| {
-            if pat_util::pat_is_binding(def_map, pat) {
-                let tcx = typer.tcx;
-
-                debug!("binding cmt_pat={:?} pat={:?} match_mode={:?}",
-                       cmt_pat,
-                       pat,
-                       match_mode);
+            if let PatKind::Binding(bmode, _, _) = pat.node {
+                debug!("binding cmt_pat={:?} pat={:?} match_mode={:?}", cmt_pat, pat, match_mode);
 
                 // pat_ty: the type of the binding being produced.
-                let pat_ty = return_if_err!(typer.node_ty(pat.id));
+                let pat_ty = return_if_err!(infcx.node_ty(pat.id));
 
                 // Each match binding is effectively an assignment to the
                 // binding being produced.
-                let def = def_map.borrow().get(&pat.id).unwrap().full_def();
-                match mc.cat_def(pat.id, pat.span, pat_ty, def) {
-                    Ok(binding_cmt) => {
-                        delegate.mutate(pat.id, pat.span, binding_cmt, Init);
-                    }
-                    Err(_) => { }
+                if let Ok(binding_cmt) = mc.cat_def(pat.id, pat.span, pat_ty,
+                                                    tcx.expect_def(pat.id)) {
+                    delegate.mutate(pat.id, pat.span, binding_cmt, MutateMode::Init);
                 }
 
                 // It is also a borrow or copy/move of the value being matched.
-                match pat.node {
-                    ast::PatIdent(ast::BindByRef(m), _, _) => {
+                match bmode {
+                    hir::BindByRef(m) => {
                         if let ty::TyRef(&r, _) = pat_ty.sty {
                             let bk = ty::BorrowKind::from_mutbl(m);
-                            delegate.borrow(pat.id, pat.span, cmt_pat,
-                                            r, bk, RefBinding);
+                            delegate.borrow(pat.id, pat.span, cmt_pat, r, bk, RefBinding);
                         }
                     }
-                    ast::PatIdent(ast::BindByValue(_), _, _) => {
-                        let mode = copy_or_move(typer, &cmt_pat, PatBindingMove);
+                    hir::BindByValue(..) => {
+                        let mode = copy_or_move(infcx, &cmt_pat, PatBindingMove);
                         debug!("walk_pat binding consuming pat");
                         delegate.consume_pat(pat, cmt_pat, mode);
                     }
-                    _ => {
-                        tcx.sess.span_bug(
-                            pat.span,
-                            "binding pattern not an identifier");
-                    }
-                }
-            } else {
-                match pat.node {
-                    ast::PatVec(_, Some(ref slice_pat), _) => {
-                        // The `slice_pat` here creates a slice into
-                        // the original vector.  This is effectively a
-                        // borrow of the elements of the vector being
-                        // matched.
-
-                        let (slice_cmt, slice_mutbl, slice_r) =
-                            return_if_err!(mc.cat_slice_pattern(cmt_pat, &**slice_pat));
-
-                        // Note: We declare here that the borrow
-                        // occurs upon entering the `[...]`
-                        // pattern. This implies that something like
-                        // `[a; b]` where `a` is a move is illegal,
-                        // because the borrow is already in effect.
-                        // In fact such a move would be safe-ish, but
-                        // it effectively *requires* that we use the
-                        // nulling out semantics to indicate when a
-                        // value has been moved, which we are trying
-                        // to move away from.  Otherwise, how can we
-                        // indicate that the first element in the
-                        // vector has been moved?  Eventually, we
-                        // could perhaps modify this rule to permit
-                        // `[..a, b]` where `b` is a move, because in
-                        // that case we can adjust the length of the
-                        // original vec accordingly, but we'd have to
-                        // make trans do the right thing, and it would
-                        // only work for `Box<[T]>`s. It seems simpler
-                        // to just require that people call
-                        // `vec.pop()` or `vec.unshift()`.
-                        let slice_bk = ty::BorrowKind::from_mutbl(slice_mutbl);
-                        delegate.borrow(pat.id, pat.span,
-                                        slice_cmt, slice_r,
-                                        slice_bk, RefBinding);
-                    }
-                    _ => { }
                 }
             }
         }));
@@ -1084,123 +998,47 @@ impl<'d,'t,'a,'tcx> ExprUseVisitor<'d,'t,'a,'tcx> {
         // to the above loop's visit of than the bindings that form
         // the leaves of the pattern tree structure.
         return_if_err!(mc.cat_pattern(cmt_discr, pat, |mc, cmt_pat, pat| {
-            let def_map = def_map.borrow();
-            let tcx = typer.tcx;
+            match tcx.expect_def_or_none(pat.id) {
+                Some(Def::Variant(enum_did, variant_did)) => {
+                    let downcast_cmt = if tcx.lookup_adt_def(enum_did).is_univariant() {
+                        cmt_pat
+                    } else {
+                        let cmt_pat_ty = cmt_pat.ty;
+                        mc.cat_downcast(pat, cmt_pat, cmt_pat_ty, variant_did)
+                    };
 
-            match pat.node {
-                ast::PatEnum(_, _) | ast::PatQPath(..) |
-                ast::PatIdent(_, _, None) | ast::PatStruct(..) => {
-                    match def_map.get(&pat.id).map(|d| d.full_def()) {
-                        None => {
-                            // no definition found: pat is not a
-                            // struct or enum pattern.
-                        }
-
-                        Some(def::DefVariant(enum_did, variant_did, _is_struct)) => {
-                            let downcast_cmt =
-                                if tcx.enum_is_univariant(enum_did) {
-                                    cmt_pat
-                                } else {
-                                    let cmt_pat_ty = cmt_pat.ty;
-                                    mc.cat_downcast(pat, cmt_pat, cmt_pat_ty, variant_did)
-                                };
-
-                            debug!("variant downcast_cmt={:?} pat={:?}",
-                                   downcast_cmt,
-                                   pat);
-
-                            delegate.matched_pat(pat, downcast_cmt, match_mode);
-                        }
-
-                        Some(def::DefStruct(..)) | Some(def::DefTy(_, false)) => {
-                            // A struct (in either the value or type
-                            // namespace; we encounter the former on
-                            // e.g. patterns for unit structs).
-
-                            debug!("struct cmt_pat={:?} pat={:?}",
-                                   cmt_pat,
-                                   pat);
-
-                            delegate.matched_pat(pat, cmt_pat, match_mode);
-                        }
-
-                        Some(def::DefConst(..)) |
-                        Some(def::DefAssociatedConst(..)) |
-                        Some(def::DefLocal(..)) => {
-                            // This is a leaf (i.e. identifier binding
-                            // or constant value to match); thus no
-                            // `matched_pat` call.
-                        }
-
-                        Some(def @ def::DefTy(_, true)) => {
-                            // An enum's type -- should never be in a
-                            // pattern.
-
-                            if !tcx.sess.has_errors() {
-                                let msg = format!("Pattern has unexpected type: {:?} and type {:?}",
-                                                  def,
-                                                  cmt_pat.ty);
-                                tcx.sess.span_bug(pat.span, &msg)
-                            }
-                        }
-
-                        Some(def) => {
-                            // Remaining cases are e.g. DefFn, to
-                            // which identifiers within patterns
-                            // should not resolve. However, we do
-                            // encouter this when using the
-                            // expr-use-visitor during typeck. So just
-                            // ignore it, an error should have been
-                            // reported.
-
-                            if !tcx.sess.has_errors() {
-                                let msg = format!("Pattern has unexpected def: {:?} and type {:?}",
-                                                  def,
-                                                  cmt_pat.ty);
-                                tcx.sess.span_bug(pat.span, &msg[..])
-                            }
-                        }
-                    }
+                    debug!("variant downcast_cmt={:?} pat={:?}", downcast_cmt, pat);
+                    delegate.matched_pat(pat, downcast_cmt, match_mode);
                 }
-
-                ast::PatIdent(_, _, Some(_)) => {
-                    // Do nothing; this is a binding (not a enum
-                    // variant or struct), and the cat_pattern call
-                    // will visit the substructure recursively.
+                Some(Def::Struct(..)) | Some(Def::TyAlias(..)) | Some(Def::AssociatedTy(..)) => {
+                    debug!("struct cmt_pat={:?} pat={:?}", cmt_pat, pat);
+                    delegate.matched_pat(pat, cmt_pat, match_mode);
                 }
-
-                ast::PatWild(_) | ast::PatTup(..) | ast::PatBox(..) |
-                ast::PatRegion(..) | ast::PatLit(..) | ast::PatRange(..) |
-                ast::PatVec(..) | ast::PatMac(..) => {
-                    // Similarly, each of these cases does not
-                    // correspond to a enum variant or struct, so we
-                    // do not do any `matched_pat` calls for these
-                    // cases either.
-                }
+                _ => {}
             }
         }));
     }
 
-    fn walk_captures(&mut self, closure_expr: &ast::Expr) {
+    fn walk_captures(&mut self, closure_expr: &hir::Expr, fn_decl_span: Span) {
         debug!("walk_captures({:?})", closure_expr);
 
         self.tcx().with_freevars(closure_expr.id, |freevars| {
             for freevar in freevars {
-                let id_var = freevar.def.def_id().node;
+                let id_var = freevar.def.var_id();
                 let upvar_id = ty::UpvarId { var_id: id_var,
                                              closure_expr_id: closure_expr.id };
-                let upvar_capture = self.typer.upvar_capture(upvar_id).unwrap();
+                let upvar_capture = self.mc.infcx.upvar_capture(upvar_id).unwrap();
                 let cmt_var = return_if_err!(self.cat_captured_var(closure_expr.id,
-                                                                   closure_expr.span,
+                                                                   fn_decl_span,
                                                                    freevar.def));
                 match upvar_capture {
                     ty::UpvarCapture::ByValue => {
-                        let mode = copy_or_move(self.typer, &cmt_var, CaptureMove);
+                        let mode = copy_or_move(self.mc.infcx, &cmt_var, CaptureMove);
                         self.delegate.consume(closure_expr.id, freevar.span, cmt_var, mode);
                     }
                     ty::UpvarCapture::ByRef(upvar_borrow) => {
                         self.delegate.borrow(closure_expr.id,
-                                             closure_expr.span,
+                                             fn_decl_span,
                                              cmt_var,
                                              upvar_borrow.region,
                                              upvar_borrow.kind,
@@ -1214,22 +1052,22 @@ impl<'d,'t,'a,'tcx> ExprUseVisitor<'d,'t,'a,'tcx> {
     fn cat_captured_var(&mut self,
                         closure_id: ast::NodeId,
                         closure_span: Span,
-                        upvar_def: def::Def)
+                        upvar_def: Def)
                         -> mc::McResult<mc::cmt<'tcx>> {
         // Create the cmt for the variable being borrowed, from the
         // caller's perspective
-        let var_id = upvar_def.def_id().node;
-        let var_ty = try!(self.typer.node_ty(var_id));
+        let var_id = upvar_def.var_id();
+        let var_ty = self.mc.infcx.node_ty(var_id)?;
         self.mc.cat_def(closure_id, closure_span, var_ty, upvar_def)
     }
 }
 
-fn copy_or_move<'a, 'tcx>(typer: &infer::InferCtxt<'a, 'tcx>,
-                      cmt: &mc::cmt<'tcx>,
-                      move_reason: MoveReason)
-                      -> ConsumeMode
+fn copy_or_move<'a, 'gcx, 'tcx>(infcx: &InferCtxt<'a, 'gcx, 'tcx>,
+                                cmt: &mc::cmt<'tcx>,
+                                move_reason: MoveReason)
+                                -> ConsumeMode
 {
-    if typer.type_moves_by_default(cmt.ty, cmt.span) {
+    if infcx.type_moves_by_default(cmt.ty, cmt.span) {
         Move(move_reason)
     } else {
         Copy

@@ -12,7 +12,7 @@
 
 macro_rules! test { () => { fn foo() -> i32 { 1; } } }
                                            //~^ ERROR not all control paths return a value
-                                           //~^^ HELP consider removing this semicolon
+                                           //~| HELP consider removing this semicolon
 
 fn no_return() -> i32 {} //~ ERROR  not all control paths return a value
 

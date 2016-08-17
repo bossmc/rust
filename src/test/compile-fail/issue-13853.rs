@@ -13,11 +13,14 @@ trait Node {
 }
 
 trait Graph<N: Node> {
-    fn nodes<'a, I: Iterator<Item=&'a N>>(&'a self) -> I;
+    fn nodes<'a, I: Iterator<Item=&'a N>>(&'a self) -> I
+        where N: 'a;
 }
 
 impl<N: Node> Graph<N> for Vec<N> {
-    fn nodes<'a, I: Iterator<Item=&'a N>>(&self) -> I {
+    fn nodes<'a, I: Iterator<Item=&'a N>>(&self) -> I
+        where N: 'a
+    {
         self.iter() //~ ERROR mismatched types
     }
 }
@@ -32,7 +35,7 @@ impl Node for Stuff {
 
 fn iterate<N: Node, G: Graph<N>>(graph: &G) {
     for node in graph.iter() { //~ ERROR no method named `iter` found
-        node.zomg();  //~ error: the type of this value must be known in this context
+        node.zomg();
     }
 }
 

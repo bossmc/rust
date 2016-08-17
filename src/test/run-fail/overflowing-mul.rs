@@ -8,12 +8,11 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-// error-pattern:thread '<main>' panicked at 'arithmetic operation overflowed'
+// ignore-pretty : (#23623) problems when  ending with // comments
+
+// error-pattern:thread 'main' panicked at 'attempt to multiply with overflow'
 // compile-flags: -C debug-assertions
 
-// (Work around constant-evaluation)
-fn value() -> u8 { 200 }
-
 fn main() {
-    let x = value() * 4;
+    let x = 200u8 * 4;
 }

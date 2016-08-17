@@ -21,7 +21,8 @@ use sys_common::{AsInner, FromInner, IntoInner};
 impl FromRawHandle for process::Stdio {
     unsafe fn from_raw_handle(handle: RawHandle) -> process::Stdio {
         let handle = sys::handle::Handle::new(handle as *mut _);
-        process::Stdio::from_inner(handle)
+        let io = sys::process::Stdio::Handle(handle);
+        process::Stdio::from_inner(io)
     }
 }
 
@@ -32,6 +33,7 @@ impl AsRawHandle for process::Child {
     }
 }
 
+#[stable(feature = "process_extensions", since = "1.2.0")]
 impl IntoRawHandle for process::Child {
     fn into_raw_handle(self) -> RawHandle {
         self.into_inner().into_handle().into_raw() as *mut _
@@ -59,20 +61,38 @@ impl AsRawHandle for process::ChildStderr {
     }
 }
 
+#[stable(feature = "process_extensions", since = "1.2.0")]
 impl IntoRawHandle for process::ChildStdin {
     fn into_raw_handle(self) -> RawHandle {
         self.into_inner().into_handle().into_raw() as *mut _
     }
 }
 
+#[stable(feature = "process_extensions", since = "1.2.0")]
 impl IntoRawHandle for process::ChildStdout {
     fn into_raw_handle(self) -> RawHandle {
         self.into_inner().into_handle().into_raw() as *mut _
     }
 }
 
+#[stable(feature = "process_extensions", since = "1.2.0")]
 impl IntoRawHandle for process::ChildStderr {
     fn into_raw_handle(self) -> RawHandle {
         self.into_inner().into_handle().into_raw() as *mut _
+    }
+}
+
+/// Windows-specific extensions to `std::process::ExitStatus`
+#[unstable(feature = "exit_status_from", issue = "32713")]
+pub trait ExitStatusExt {
+    /// Creates a new `ExitStatus` from the raw underlying `u32` return value of
+    /// a process.
+    fn from_raw(raw: u32) -> Self;
+}
+
+#[stable(feature = "rust1", since = "1.0.0")]
+impl ExitStatusExt for process::ExitStatus {
+    fn from_raw(raw: u32) -> Self {
+        process::ExitStatus::from_inner(From::from(raw))
     }
 }

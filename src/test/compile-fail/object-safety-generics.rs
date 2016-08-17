@@ -22,15 +22,17 @@ trait Quux {
 }
 
 fn make_bar<T:Bar>(t: &T) -> &Bar {
-    t
-        //~^ ERROR `Bar` is not object-safe
+        //~^ ERROR E0038
         //~| NOTE method `bar` has generic type parameters
+        //~| NOTE the trait `Bar` cannot be made into an object
+    t
 }
 
 fn make_bar_explicit<T:Bar>(t: &T) -> &Bar {
+    //~^ ERROR E0038
+    //~| NOTE method `bar` has generic type parameters
+    //~| NOTE the trait `Bar` cannot be made into an object
     t as &Bar
-        //~^ ERROR `Bar` is not object-safe
-        //~| NOTE method `bar` has generic type parameters
 }
 
 fn make_quux<T:Quux>(t: &T) -> &Quux {

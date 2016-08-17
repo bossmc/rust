@@ -10,15 +10,11 @@
 
 use ast;
 use attr;
-use codemap::{DUMMY_SP, Span, ExpnInfo, NameAndSpan, MacroAttribute};
-use codemap;
-use fold::Folder;
-use fold;
-use parse::token::InternedString;
-use parse::token::special_idents;
+use syntax_pos::{DUMMY_SP, Span};
+use codemap::{self, ExpnInfo, NameAndSpan, MacroAttribute};
+use parse::token::{intern, InternedString, keywords};
 use parse::{token, ParseSess};
 use ptr::P;
-use util::small_vector::SmallVector;
 
 /// Craft a span that will be ignored by the stability lint's
 /// call to codemap's is_internal check.
@@ -27,8 +23,7 @@ fn ignored_span(sess: &ParseSess, sp: Span) -> Span {
     let info = ExpnInfo {
         call_site: DUMMY_SP,
         callee: NameAndSpan {
-            name: "std_inject".to_string(),
-            format: MacroAttribute,
+            format: MacroAttribute(intern("std_inject")),
             span: None,
             allow_internal_unstable: true,
         }
@@ -39,137 +34,62 @@ fn ignored_span(sess: &ParseSess, sp: Span) -> Span {
     return sp;
 }
 
-pub fn maybe_inject_crates_ref(krate: ast::Crate, alt_std_name: Option<String>)
+pub fn no_core(krate: &ast::Crate) -> bool {
+    attr::contains_name(&krate.attrs, "no_core")
+}
+
+pub fn no_std(krate: &ast::Crate) -> bool {
+    attr::contains_name(&krate.attrs, "no_std") || no_core(krate)
+}
+
+pub fn maybe_inject_crates_ref(sess: &ParseSess,
+                               mut krate: ast::Crate,
+                               alt_std_name: Option<String>)
                                -> ast::Crate {
-    if use_std(&krate) {
-        inject_crates_ref(krate, alt_std_name)
-    } else {
-        krate
-    }
-}
-
-pub fn maybe_inject_prelude(sess: &ParseSess, krate: ast::Crate) -> ast::Crate {
-    if use_std(&krate) {
-        let mut fold = PreludeInjector {
-            span: ignored_span(sess, DUMMY_SP)
-        };
-        fold.fold_crate(krate)
-    } else {
-        krate
-    }
-}
-
-pub fn use_std(krate: &ast::Crate) -> bool {
-    !attr::contains_name(&krate.attrs, "no_std")
-}
-
-fn no_prelude(attrs: &[ast::Attribute]) -> bool {
-    attr::contains_name(attrs, "no_implicit_prelude")
-}
-
-struct StandardLibraryInjector {
-    alt_std_name: Option<String>,
-}
-
-impl fold::Folder for StandardLibraryInjector {
-    fn fold_crate(&mut self, mut krate: ast::Crate) -> ast::Crate {
-
-        // The name to use in `extern crate name as std;`
-        let actual_crate_name = match self.alt_std_name {
-            Some(ref s) => token::intern(&s),
-            None => token::intern("std"),
-        };
-
-        krate.module.items.insert(0, P(ast::Item {
-            id: ast::DUMMY_NODE_ID,
-            ident: token::str_to_ident("std"),
-            attrs: vec!(
-                attr::mk_attr_outer(attr::mk_attr_id(), attr::mk_word_item(
-                        InternedString::new("macro_use")))),
-            node: ast::ItemExternCrate(Some(actual_crate_name)),
-            vis: ast::Inherited,
-            span: DUMMY_SP
-        }));
-
-        krate
-    }
-}
-
-fn inject_crates_ref(krate: ast::Crate, alt_std_name: Option<String>) -> ast::Crate {
-    let mut fold = StandardLibraryInjector {
-        alt_std_name: alt_std_name
-    };
-    fold.fold_crate(krate)
-}
-
-struct PreludeInjector {
-    span: Span
-}
-
-impl fold::Folder for PreludeInjector {
-    fn fold_crate(&mut self, mut krate: ast::Crate) -> ast::Crate {
-        // only add `use std::prelude::*;` if there wasn't a
-        // `#![no_implicit_prelude]` at the crate level.
-        // fold_mod() will insert glob path.
-        if !no_prelude(&krate.attrs) {
-            krate.module = self.fold_mod(krate.module);
-        }
-        krate
+    if no_core(&krate) {
+        return krate;
     }
 
-    fn fold_item(&mut self, item: P<ast::Item>) -> SmallVector<P<ast::Item>> {
-        if !no_prelude(&item.attrs) {
-            // only recur if there wasn't `#![no_implicit_prelude]`
-            // on this item, i.e. this means that the prelude is not
-            // implicitly imported though the whole subtree
-            fold::noop_fold_item(item, self)
-        } else {
-            SmallVector::one(item)
-        }
-    }
+    let name = if no_std(&krate) { "core" } else { "std" };
+    let crate_name = token::intern(&alt_std_name.unwrap_or(name.to_string()));
 
-    fn fold_mod(&mut self, mut mod_: ast::Mod) -> ast::Mod {
-        let prelude_path = ast::Path {
-            span: self.span,
+    krate.module.items.insert(0, P(ast::Item {
+        attrs: vec![attr::mk_attr_outer(attr::mk_attr_id(),
+                                        attr::mk_word_item(InternedString::new("macro_use")))],
+        vis: ast::Visibility::Inherited,
+        node: ast::ItemKind::ExternCrate(Some(crate_name)),
+        ident: token::str_to_ident(name),
+        id: ast::DUMMY_NODE_ID,
+        span: DUMMY_SP,
+    }));
+
+    let span = ignored_span(sess, DUMMY_SP);
+    krate.module.items.insert(0, P(ast::Item {
+        attrs: vec![ast::Attribute {
+            node: ast::Attribute_ {
+                style: ast::AttrStyle::Outer,
+                value: P(ast::MetaItem {
+                    node: ast::MetaItemKind::Word(token::intern_and_get_ident("prelude_import")),
+                    span: span,
+                }),
+                id: attr::mk_attr_id(),
+                is_sugared_doc: false,
+            },
+            span: span,
+        }],
+        vis: ast::Visibility::Inherited,
+        node: ast::ItemKind::Use(P(codemap::dummy_spanned(ast::ViewPathGlob(ast::Path {
             global: false,
-            segments: vec![
-                ast::PathSegment {
-                    identifier: token::str_to_ident("std"),
-                    parameters: ast::PathParameters::none(),
-                },
-                ast::PathSegment {
-                    identifier: token::str_to_ident("prelude"),
-                    parameters: ast::PathParameters::none(),
-                },
-                ast::PathSegment {
-                    identifier: token::str_to_ident("v1"),
-                    parameters: ast::PathParameters::none(),
-                },
-            ],
-        };
+            segments: vec![name, "prelude", "v1"].into_iter().map(|name| ast::PathSegment {
+                identifier: token::str_to_ident(name),
+                parameters: ast::PathParameters::none(),
+            }).collect(),
+            span: span,
+        })))),
+        id: ast::DUMMY_NODE_ID,
+        ident: keywords::Invalid.ident(),
+        span: span,
+    }));
 
-        let vp = P(codemap::dummy_spanned(ast::ViewPathGlob(prelude_path)));
-        mod_.items.insert(0, P(ast::Item {
-            id: ast::DUMMY_NODE_ID,
-            ident: special_idents::invalid,
-            node: ast::ItemUse(vp),
-            attrs: vec![ast::Attribute {
-                span: self.span,
-                node: ast::Attribute_ {
-                    id: attr::mk_attr_id(),
-                    style: ast::AttrOuter,
-                    value: P(ast::MetaItem {
-                        span: self.span,
-                        node: ast::MetaWord(token::get_name(
-                                special_idents::prelude_import.name)),
-                    }),
-                    is_sugared_doc: false,
-                },
-            }],
-            vis: ast::Inherited,
-            span: self.span,
-        }));
-
-        fold::noop_fold_mod(mod_, self)
-    }
+    krate
 }

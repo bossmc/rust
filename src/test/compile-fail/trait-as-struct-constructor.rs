@@ -12,5 +12,6 @@ trait TraitNotAStruct {}
 
 fn main() {
     TraitNotAStruct{ value: 0 };
-    //~^ ERROR: use of trait `TraitNotAStruct` as a struct constructor [E0159]
+    //~^ ERROR: `TraitNotAStruct` does not name a struct or a struct variant [E0071]
+    //~| NOTE not a struct
 }

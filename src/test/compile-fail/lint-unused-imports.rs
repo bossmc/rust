@@ -24,6 +24,8 @@ use test::A;       //~ ERROR unused import
 // Be sure that if we just bring some methods into scope that they're also
 // counted as being used.
 use test::B;
+// But only when actually used: do not get confused by the method with the same name.
+use test::B2; //~ ERROR unused import
 
 // Make sure this import is warned about when at least one of its imported names
 // is unused
@@ -37,6 +39,7 @@ mod test2 {
 mod test {
     pub trait A { fn a(&self) {} }
     pub trait B { fn b(&self) {} }
+    pub trait B2 { fn b(&self) {} }
     pub struct C;
     impl A for C {}
     impl B for C {}
@@ -50,17 +53,37 @@ mod foo {
 mod bar {
     // Don't ignore on 'pub use' because we're not sure if it's used or not
     pub use std::cmp::PartialEq;
+    pub struct Square;
 
     pub mod c {
         use foo::Point;
         use foo::Square; //~ ERROR unused import
-        pub fn cc(p: Point) -> isize { return 2 * (p.x + p.y); }
+        pub fn cc(_p: Point) -> super::Square {
+            fn f() -> super::Square {
+                super::Square
+            }
+            f()
+        }
     }
 
     #[allow(unused_imports)]
     mod foo {
         use std::cmp::PartialEq;
     }
+}
+
+fn g() {
+    use self::g; //~ ERROR unused import
+    fn f() {
+        self::g();
+    }
+}
+
+// c.f. issue #35135
+#[allow(unused_variables)]
+fn h() {
+    use test2::foo; //~ ERROR unused import
+    let foo = 0;
 }
 
 fn main() {

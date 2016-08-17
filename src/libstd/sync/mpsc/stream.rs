@@ -22,11 +22,10 @@ pub use self::UpgradeResult::*;
 pub use self::SelectionResult::*;
 use self::Message::*;
 
-use core::prelude::*;
-
 use core::cmp;
 use core::isize;
 use thread;
+use time::Instant;
 
 use sync::atomic::{AtomicIsize, AtomicUsize, Ordering, AtomicBool};
 use sync::mpsc::Receiver;
@@ -174,7 +173,7 @@ impl<T> Packet<T> {
         Err(unsafe { SignalToken::cast_from_usize(ptr) })
     }
 
-    pub fn recv(&mut self) -> Result<T, Failure<T>> {
+    pub fn recv(&mut self, deadline: Option<Instant>) -> Result<T, Failure<T>> {
         // Optimistic preflight check (scheduling is expensive).
         match self.try_recv() {
             Err(Empty) => {}
@@ -185,7 +184,15 @@ impl<T> Packet<T> {
         // initiate the blocking protocol.
         let (wait_token, signal_token) = blocking::tokens();
         if self.decrement(signal_token).is_ok() {
-            wait_token.wait()
+            if let Some(deadline) = deadline {
+                let timed_out = !wait_token.wait_max_until(deadline);
+                if timed_out {
+                    try!(self.abort_selection(/* was_upgrade = */ false)
+                             .map_err(Upgraded));
+                }
+            } else {
+                wait_token.wait();
+            }
         }
 
         match self.try_recv() {
@@ -309,12 +316,7 @@ impl<T> Packet<T> {
                             steals, DISCONNECTED, Ordering::SeqCst);
             cnt != DISCONNECTED && cnt != steals
         } {
-            loop {
-                match self.queue.pop() {
-                    Some(..) => { steals += 1; }
-                    None => break
-                }
-            }
+            while let Some(_) = self.queue.pop() { steals += 1; }
         }
 
         // At this point in time, we have gated all future senders from sending,
@@ -339,7 +341,7 @@ impl<T> Packet<T> {
         // the internal state.
         match self.queue.peek() {
             Some(&mut GoUp(..)) => {
-                match self.recv() {
+                match self.recv(None) {
                     Err(Upgraded(port)) => Err(port),
                     _ => unreachable!(),
                 }
@@ -380,7 +382,7 @@ impl<T> Packet<T> {
                 // previous value is positive because we're not going to sleep
                 let prev = self.bump(1);
                 assert!(prev == DISCONNECTED || prev >= 0);
-                return ret;
+                ret
             }
         }
     }

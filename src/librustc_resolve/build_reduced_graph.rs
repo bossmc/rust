@@ -13,340 +13,150 @@
 //! Here we build the "reduced graph": the graph of the module tree without
 //! any imports resolved.
 
-use DefModifiers;
-use resolve_imports::ImportDirective;
-use resolve_imports::ImportDirectiveSubclass::{self, SingleImport, GlobImport};
-use resolve_imports::ImportResolution;
+use resolve_imports::ImportDirectiveSubclass::{self, GlobImport};
 use Module;
-use ModuleKind::*;
-use Namespace::{TypeNS, ValueNS};
-use NameBindings;
-use {names_to_string, module_to_string};
-use ParentLink::{self, ModuleParentLink, BlockParentLink};
+use Namespace::{self, TypeNS, ValueNS};
+use {NameBinding, NameBindingKind, ToNameBinding};
+use ParentLink::{ModuleParentLink, BlockParentLink};
 use Resolver;
-use resolve_imports::Shadowable;
-use TypeNsDef;
-use {resolve_error, ResolutionError};
+use {resolve_error, resolve_struct_error, ResolutionError};
 
-use self::DuplicateCheckingMode::*;
-use self::NamespaceError::*;
+use rustc::middle::cstore::{ChildItem, DlDef};
+use rustc::hir::def::*;
+use rustc::hir::def_id::{CRATE_DEF_INDEX, DefId};
+use rustc::ty::{self, VariantKind};
 
-use rustc::metadata::csearch;
-use rustc::metadata::decoder::{DefLike, DlDef, DlField, DlImpl};
-use rustc::middle::def::*;
+use syntax::ast::Name;
+use syntax::attr;
+use syntax::parse::token;
 
 use syntax::ast::{Block, Crate};
-use syntax::ast::{DeclItem, DefId};
-use syntax::ast::{ForeignItem, ForeignItemFn, ForeignItemStatic};
-use syntax::ast::{Item, ItemConst, ItemEnum, ItemExternCrate, ItemFn};
-use syntax::ast::{ItemForeignMod, ItemImpl, ItemMac, ItemMod, ItemStatic, ItemDefaultImpl};
-use syntax::ast::{ItemStruct, ItemTrait, ItemTy, ItemUse};
-use syntax::ast::{Name, NamedField, NodeId};
-use syntax::ast::{PathListIdent, PathListMod, Public};
-use syntax::ast::StmtDecl;
-use syntax::ast::StructVariantKind;
-use syntax::ast::TupleVariantKind;
-use syntax::ast::UnnamedField;
+use syntax::ast::{ForeignItem, ForeignItemKind, Item, ItemKind};
+use syntax::ast::{Mutability, PathListItemKind};
+use syntax::ast::{StmtKind, TraitItemKind};
 use syntax::ast::{Variant, ViewPathGlob, ViewPathList, ViewPathSimple};
-use syntax::ast::Visibility;
-use syntax::ast;
-use syntax::ast_util::local_def;
-use syntax::attr::AttrMetaMethods;
-use syntax::parse::token::{self, special_idents};
-use syntax::codemap::{Span, DUMMY_SP};
 use syntax::visit::{self, Visitor};
 
-use std::mem::replace;
-use std::ops::{Deref, DerefMut};
-use std::rc::Rc;
+use syntax_pos::{Span, DUMMY_SP};
 
-// Specifies how duplicates should be handled when adding a child item if
-// another item exists with the same name in some namespace.
-#[derive(Copy, Clone, PartialEq)]
-enum DuplicateCheckingMode {
-    ForbidDuplicateModules,
-    ForbidDuplicateTypesAndModules,
-    ForbidDuplicateValues,
-    ForbidDuplicateTypesAndValues,
-    OverwriteDuplicates
-}
-
-#[derive(Copy, Clone, PartialEq)]
-enum NamespaceError {
-    NoError,
-    ModuleError,
-    TypeError,
-    ValueError
-}
-
-fn namespace_error_to_string(ns: NamespaceError) -> &'static str {
-    match ns {
-        NoError                 => "",
-        ModuleError | TypeError => "type or module",
-        ValueError              => "value",
+impl<'a> ToNameBinding<'a> for (Module<'a>, Span, ty::Visibility) {
+    fn to_name_binding(self) -> NameBinding<'a> {
+        NameBinding { kind: NameBindingKind::Module(self.0), span: self.1, vis: self.2 }
     }
 }
 
-struct GraphBuilder<'a, 'b:'a, 'tcx:'b> {
-    resolver: &'a mut Resolver<'b, 'tcx>
-}
-
-impl<'a, 'b:'a, 'tcx:'b> Deref for GraphBuilder<'a, 'b, 'tcx> {
-    type Target = Resolver<'b, 'tcx>;
-
-    fn deref(&self) -> &Resolver<'b, 'tcx> {
-        &*self.resolver
+impl<'a> ToNameBinding<'a> for (Def, Span, ty::Visibility) {
+    fn to_name_binding(self) -> NameBinding<'a> {
+        NameBinding { kind: NameBindingKind::Def(self.0), span: self.1, vis: self.2 }
     }
 }
 
-impl<'a, 'b:'a, 'tcx:'b> DerefMut for GraphBuilder<'a, 'b, 'tcx> {
-    fn deref_mut(&mut self) -> &mut Resolver<'b, 'tcx> {
-        &mut *self.resolver
-    }
-}
-
-impl<'a, 'b:'a, 'tcx:'b> GraphBuilder<'a, 'b, 'tcx> {
+impl<'b> Resolver<'b> {
     /// Constructs the reduced graph for the entire crate.
-    fn build_reduced_graph(self, krate: &ast::Crate) {
-        let parent = self.graph_root.get_module();
+    pub fn build_reduced_graph(&mut self, krate: &Crate) {
+        let no_implicit_prelude = attr::contains_name(&krate.attrs, "no_implicit_prelude");
+        self.graph_root.no_implicit_prelude.set(no_implicit_prelude);
+
         let mut visitor = BuildReducedGraphVisitor {
-            builder: self,
-            parent: parent
+            parent: self.graph_root,
+            resolver: self,
         };
         visit::walk_crate(&mut visitor, krate);
     }
 
-    /// Adds a new child item to the module definition of the parent node and
-    /// returns its corresponding name bindings as well as the current parent.
-    /// Or, if we're inside a block, creates (or reuses) an anonymous module
-    /// corresponding to the innermost block ID and returns the name bindings
-    /// as well as the newly-created parent.
-    ///
-    /// # Panics
-    ///
-    /// Panics if this node does not have a module definition and we are not inside
-    /// a block.
-    fn add_child(&self,
-                 name: Name,
-                 parent: &Rc<Module>,
-                 duplicate_checking_mode: DuplicateCheckingMode,
-                 // For printing errors
-                 sp: Span)
-                 -> Rc<NameBindings> {
-        // If this is the immediate descendant of a module, then we add the
-        // child name directly. Otherwise, we create or reuse an anonymous
-        // module and add the child to that.
-
-        self.check_for_conflicts_between_external_crates_and_items(&**parent,
-                                                                   name,
-                                                                   sp);
-
-        // Add or reuse the child.
-        let child = parent.children.borrow().get(&name).cloned();
-        match child {
-            None => {
-                let child = Rc::new(NameBindings::new());
-                parent.children.borrow_mut().insert(name, child.clone());
-                child
-            }
-            Some(child) => {
-                // Enforce the duplicate checking mode:
-                //
-                // * If we're requesting duplicate module checking, check that
-                //   there isn't a module in the module with the same name.
-                //
-                // * If we're requesting duplicate type checking, check that
-                //   there isn't a type in the module with the same name.
-                //
-                // * If we're requesting duplicate value checking, check that
-                //   there isn't a value in the module with the same name.
-                //
-                // * If we're requesting duplicate type checking and duplicate
-                //   value checking, check that there isn't a duplicate type
-                //   and a duplicate value with the same name.
-                //
-                // * If no duplicate checking was requested at all, do
-                //   nothing.
-
-                let mut duplicate_type = NoError;
-                let ns = match duplicate_checking_mode {
-                    ForbidDuplicateModules => {
-                        if child.get_module_if_available().is_some() {
-                            duplicate_type = ModuleError;
-                        }
-                        Some(TypeNS)
-                    }
-                    ForbidDuplicateTypesAndModules => {
-                        if child.defined_in_namespace(TypeNS) {
-                            duplicate_type = TypeError;
-                        }
-                        Some(TypeNS)
-                    }
-                    ForbidDuplicateValues => {
-                        if child.defined_in_namespace(ValueNS) {
-                            duplicate_type = ValueError;
-                        }
-                        Some(ValueNS)
-                    }
-                    ForbidDuplicateTypesAndValues => {
-                        let mut n = None;
-                        match child.def_for_namespace(TypeNS) {
-                            Some(DefMod(_)) | None => {}
-                            Some(_) => {
-                                n = Some(TypeNS);
-                                duplicate_type = TypeError;
-                            }
-                        };
-                        if child.defined_in_namespace(ValueNS) {
-                            duplicate_type = ValueError;
-                            n = Some(ValueNS);
-                        }
-                        n
-                    }
-                    OverwriteDuplicates => None
-                };
-                if duplicate_type != NoError {
-                    // Return an error here by looking up the namespace that
-                    // had the duplicate.
-                    let ns = ns.unwrap();
-                    resolve_error(
-                        self,
-                        sp,
-                        ResolutionError::DuplicateDefinition(
-                            namespace_error_to_string(duplicate_type),
-                            name)
-                    );
-                    {
-                        let r = child.span_for_namespace(ns);
-                        if let Some(sp) = r {
-                            self.session.span_note(sp,
-                                 &format!("first definition of {} `{}` here",
-                                      namespace_error_to_string(duplicate_type),
-                                      token::get_name(name)));
-                        }
-                    }
-                }
-                child
-            }
+    /// Defines `name` in namespace `ns` of module `parent` to be `def` if it is not yet defined;
+    /// otherwise, reports an error.
+    fn define<T>(&mut self, parent: Module<'b>, name: Name, ns: Namespace, def: T)
+        where T: ToNameBinding<'b>,
+    {
+        let binding = def.to_name_binding();
+        if let Err(old_binding) = self.try_define(parent, name, ns, binding.clone()) {
+            self.report_conflict(parent, name, ns, old_binding, &binding);
         }
     }
 
     fn block_needs_anonymous_module(&mut self, block: &Block) -> bool {
-        // Check each statement.
-        for statement in &block.stmts {
-            match statement.node {
-                StmtDecl(ref declaration, _) => {
-                    match declaration.node {
-                        DeclItem(_) => {
-                            return true;
-                        }
-                        _ => {
-                            // Keep searching.
-                        }
-                    }
-                }
-                _ => {
-                    // Keep searching.
-                }
-            }
-        }
-
-        // If we found no items, we don't need to create
-        // an anonymous module.
-
-        return false;
-    }
-
-    fn get_parent_link(&mut self, parent: &Rc<Module>, name: Name) -> ParentLink {
-        ModuleParentLink(parent.downgrade(), name)
+        // If any statements are items, we need to create an anonymous module
+        block.stmts.iter().any(|statement| match statement.node {
+            StmtKind::Item(_) => true,
+            _ => false,
+        })
     }
 
     /// Constructs the reduced graph for one item.
-    fn build_reduced_graph_for_item(&mut self, item: &Item, parent: &Rc<Module>) -> Rc<Module> {
+    fn build_reduced_graph_for_item(&mut self, item: &Item, parent_ref: &mut Module<'b>) {
+        let parent = *parent_ref;
         let name = item.ident.name;
         let sp = item.span;
-        let is_public = item.vis == ast::Public;
-        let modifiers = if is_public {
-            DefModifiers::PUBLIC
-        } else {
-            DefModifiers::empty()
-        } | DefModifiers::IMPORTABLE;
+        self.current_module = parent;
+        let vis = self.resolve_visibility(&item.vis);
 
         match item.node {
-            ItemUse(ref view_path) => {
+            ItemKind::Use(ref view_path) => {
                 // Extract and intern the module part of the path. For
                 // globs and lists, the path is found directly in the AST;
                 // for simple paths we have to munge the path a little.
-                let module_path = match view_path.node {
+                let module_path: Vec<Name> = match view_path.node {
                     ViewPathSimple(_, ref full_path) => {
                         full_path.segments
-                            .split_last().unwrap().1
-                            .iter().map(|ident| ident.identifier.name)
-                            .collect()
+                                 .split_last()
+                                 .unwrap()
+                                 .1
+                                 .iter()
+                                 .map(|seg| seg.identifier.name)
+                                 .collect()
                     }
 
                     ViewPathGlob(ref module_ident_path) |
                     ViewPathList(ref module_ident_path, _) => {
                         module_ident_path.segments
-                            .iter().map(|ident| ident.identifier.name).collect()
+                                         .iter()
+                                         .map(|seg| seg.identifier.name)
+                                         .collect()
                     }
                 };
 
                 // Build up the import directives.
-                let shadowable = item.attrs.iter().any(|attr| {
-                    attr.name() == token::get_name(special_idents::prelude_import.name)
-                });
-                let shadowable = if shadowable {
-                    Shadowable::Always
-                } else {
-                    Shadowable::Never
-                };
+                let is_prelude = attr::contains_name(&item.attrs, "prelude_import");
 
                 match view_path.node {
                     ViewPathSimple(binding, ref full_path) => {
-                        let source_name =
-                            full_path.segments.last().unwrap().identifier.name;
-                        if &token::get_name(source_name)[..] == "mod" ||
-                           &token::get_name(source_name)[..] == "self" {
+                        let source_name = full_path.segments.last().unwrap().identifier.name;
+                        if source_name.as_str() == "mod" || source_name.as_str() == "self" {
                             resolve_error(self,
-                                            view_path.span,
-                                            ResolutionError::SelfImportsOnlyAllowedWithin
-                            );
+                                          view_path.span,
+                                          ResolutionError::SelfImportsOnlyAllowedWithin);
                         }
 
-                        let subclass = SingleImport(binding.name,
-                                                    source_name);
-                        self.build_import_directive(&**parent,
-                                                    module_path,
-                                                    subclass,
-                                                    view_path.span,
-                                                    item.id,
-                                                    is_public,
-                                                    shadowable);
+                        let subclass = ImportDirectiveSubclass::single(binding.name, source_name);
+                        let span = view_path.span;
+                        parent.add_import_directive(module_path, subclass, span, item.id, vis);
+                        self.unresolved_imports += 1;
                     }
                     ViewPathList(_, ref source_items) => {
                         // Make sure there's at most one `mod` import in the list.
-                        let mod_spans = source_items.iter().filter_map(|item| match item.node {
-                            PathListMod { .. } => Some(item.span),
-                            _ => None
-                        }).collect::<Vec<Span>>();
-                        if mod_spans.len() > 1 {
-                            resolve_error(
-                                self,
-                                mod_spans[0],
-                                ResolutionError::SelfImportCanOnlyAppearOnceInTheList
-                            );
-                            for other_span in mod_spans.iter().skip(1) {
-                                self.session.span_note(*other_span,
-                                    "another `self` import appears here");
+                        let mod_spans = source_items.iter().filter_map(|item| {
+                            match item.node {
+                                PathListItemKind::Mod { .. } => Some(item.span),
+                                _ => None,
                             }
+                        }).collect::<Vec<Span>>();
+
+                        if mod_spans.len() > 1 {
+                            let mut e = resolve_struct_error(self,
+                                          mod_spans[0],
+                                          ResolutionError::SelfImportCanOnlyAppearOnceInTheList);
+                            for other_span in mod_spans.iter().skip(1) {
+                                e.span_note(*other_span, "another `self` import appears here");
+                            }
+                            e.emit();
                         }
 
                         for source_item in source_items {
-                            let (module_path, name) = match source_item.node {
-                                PathListIdent { name, .. } =>
-                                    (module_path.clone(), name.name),
-                                PathListMod { .. } => {
+                            let (module_path, name, rename) = match source_item.node {
+                                PathListItemKind::Ident { name, rename, .. } =>
+                                    (module_path.clone(), name.name, rename.unwrap_or(name).name),
+                                PathListItemKind::Mod { rename, .. } => {
                                     let name = match module_path.last() {
                                         Some(name) => *name,
                                         None => {
@@ -360,220 +170,144 @@ impl<'a, 'b:'a, 'tcx:'b> GraphBuilder<'a, 'b, 'tcx> {
                                         }
                                     };
                                     let module_path = module_path.split_last().unwrap().1;
-                                    (module_path.to_vec(), name)
+                                    let rename = rename.map(|i| i.name).unwrap_or(name);
+                                    (module_path.to_vec(), name, rename)
                                 }
                             };
-                            self.build_import_directive(
-                                &**parent,
-                                module_path,
-                                SingleImport(name, name),
-                                source_item.span,
-                                source_item.node.id(),
-                                is_public,
-                                shadowable);
+                            let subclass = ImportDirectiveSubclass::single(rename, name);
+                            let (span, id) = (source_item.span, source_item.node.id());
+                            parent.add_import_directive(module_path, subclass, span, id, vis);
+                            self.unresolved_imports += 1;
                         }
                     }
                     ViewPathGlob(_) => {
-                        self.build_import_directive(&**parent,
-                                                    module_path,
-                                                    GlobImport,
-                                                    view_path.span,
-                                                    item.id,
-                                                    is_public,
-                                                    shadowable);
+                        let subclass = GlobImport { is_prelude: is_prelude };
+                        let span = view_path.span;
+                        parent.add_import_directive(module_path, subclass, span, item.id, vis);
+                        self.unresolved_imports += 1;
                     }
                 }
-                parent.clone()
             }
 
-            ItemExternCrate(_) => {
-                // n.b. we don't need to look at the path option here, because cstore already did
-                if let Some(crate_id) = self.session.cstore.find_extern_mod_stmt_cnum(item.id) {
-                    let def_id = DefId { krate: crate_id, node: 0 };
-                    self.external_exports.insert(def_id);
-                    let parent_link = ModuleParentLink(parent.downgrade(), name);
-                    let external_module = Rc::new(Module::new(parent_link,
-                                                              Some(def_id),
-                                                              NormalModuleKind,
-                                                              false,
-                                                              true));
-                    debug!("(build reduced graph for item) found extern `{}`",
-                            module_to_string(&*external_module));
-                    self.check_for_conflicts_between_external_crates(&**parent, name, sp);
-                    parent.external_module_children.borrow_mut()
-                          .insert(name, external_module.clone());
-                    self.build_reduced_graph_for_external_crate(&external_module);
+            ItemKind::ExternCrate(_) => {
+                // n.b. we don't need to look at the path option here, because cstore already
+                // did
+                if let Some(crate_id) = self.session.cstore.extern_mod_stmt_cnum(item.id) {
+                    let def_id = DefId {
+                        krate: crate_id,
+                        index: CRATE_DEF_INDEX,
+                    };
+                    let parent_link = ModuleParentLink(parent, name);
+                    let def = Def::Mod(def_id);
+                    let module = self.new_extern_crate_module(parent_link, def, item.id);
+                    self.define(parent, name, TypeNS, (module, sp, vis));
+
+                    self.build_reduced_graph_for_external_crate(module);
                 }
-                parent.clone()
             }
 
-            ItemMod(..) => {
-                let name_bindings = self.add_child(name, parent, ForbidDuplicateModules, sp);
-
-                let parent_link = self.get_parent_link(parent, name);
-                let def_id = DefId { krate: 0, node: item.id };
-                name_bindings.define_module(parent_link,
-                                            Some(def_id),
-                                            NormalModuleKind,
-                                            false,
-                                            is_public,
-                                            sp);
-
-                name_bindings.get_module()
+            ItemKind::Mod(..) => {
+                let parent_link = ModuleParentLink(parent, name);
+                let def = Def::Mod(self.definitions.local_def_id(item.id));
+                let module = self.new_module(parent_link, Some(def), false);
+                module.no_implicit_prelude.set({
+                    parent.no_implicit_prelude.get() ||
+                        attr::contains_name(&item.attrs, "no_implicit_prelude")
+                });
+                self.define(parent, name, TypeNS, (module, sp, vis));
+                self.module_map.insert(item.id, module);
+                *parent_ref = module;
             }
 
-            ItemForeignMod(..) => parent.clone(),
+            ItemKind::ForeignMod(..) => {}
 
             // These items live in the value namespace.
-            ItemStatic(_, m, _) => {
-                let name_bindings = self.add_child(name, parent, ForbidDuplicateValues, sp);
-                let mutbl = m == ast::MutMutable;
-
-                name_bindings.define_value(DefStatic(local_def(item.id), mutbl), sp, modifiers);
-                parent.clone()
+            ItemKind::Static(_, m, _) => {
+                let mutbl = m == Mutability::Mutable;
+                let def = Def::Static(self.definitions.local_def_id(item.id), mutbl);
+                self.define(parent, name, ValueNS, (def, sp, vis));
             }
-            ItemConst(_, _) => {
-                self.add_child(name, parent, ForbidDuplicateValues, sp)
-                    .define_value(DefConst(local_def(item.id)), sp, modifiers);
-                parent.clone()
+            ItemKind::Const(_, _) => {
+                let def = Def::Const(self.definitions.local_def_id(item.id));
+                self.define(parent, name, ValueNS, (def, sp, vis));
             }
-            ItemFn(_, _, _, _, _, _) => {
-                let name_bindings = self.add_child(name, parent, ForbidDuplicateValues, sp);
-
-                let def = DefFn(local_def(item.id), false);
-                name_bindings.define_value(def, sp, modifiers);
-                parent.clone()
+            ItemKind::Fn(_, _, _, _, _, _) => {
+                let def = Def::Fn(self.definitions.local_def_id(item.id));
+                self.define(parent, name, ValueNS, (def, sp, vis));
             }
 
             // These items live in the type namespace.
-            ItemTy(..) => {
-                let name_bindings =
-                    self.add_child(name, parent, ForbidDuplicateTypesAndModules, sp);
-
-                name_bindings.define_type(DefTy(local_def(item.id), false), sp,
-                                          modifiers);
-
-                let parent_link = self.get_parent_link(parent, name);
-                name_bindings.set_module_kind(parent_link,
-                                              Some(local_def(item.id)),
-                                              TypeModuleKind,
-                                              false,
-                                              is_public,
-                                              sp);
-                parent.clone()
+            ItemKind::Ty(..) => {
+                let def = Def::TyAlias(self.definitions.local_def_id(item.id));
+                self.define(parent, name, TypeNS, (def, sp, vis));
             }
 
-            ItemEnum(ref enum_definition, _) => {
-                let name_bindings =
-                    self.add_child(name, parent, ForbidDuplicateTypesAndModules, sp);
-
-                name_bindings.define_type(DefTy(local_def(item.id), true), sp, modifiers);
-
-                let parent_link = self.get_parent_link(parent, name);
-                name_bindings.set_module_kind(parent_link,
-                                              Some(local_def(item.id)),
-                                              EnumModuleKind,
-                                              false,
-                                              is_public,
-                                              sp);
-
-                let module = name_bindings.get_module();
+            ItemKind::Enum(ref enum_definition, _) => {
+                let parent_link = ModuleParentLink(parent, name);
+                let def = Def::Enum(self.definitions.local_def_id(item.id));
+                let module = self.new_module(parent_link, Some(def), false);
+                self.define(parent, name, TypeNS, (module, sp, vis));
 
                 for variant in &(*enum_definition).variants {
-                    self.build_reduced_graph_for_variant(
-                        &**variant,
-                        local_def(item.id),
-                        &module);
+                    let item_def_id = self.definitions.local_def_id(item.id);
+                    self.build_reduced_graph_for_variant(variant, item_def_id, module, vis);
                 }
-                parent.clone()
             }
 
             // These items live in both the type and value namespaces.
-            ItemStruct(ref struct_def, _) => {
-                // Adding to both Type and Value namespaces or just Type?
-                let (forbid, ctor_id) = match struct_def.ctor_id {
-                    Some(ctor_id)   => (ForbidDuplicateTypesAndValues, Some(ctor_id)),
-                    None            => (ForbidDuplicateTypesAndModules, None)
-                };
-
-                let name_bindings = self.add_child(name, parent, forbid, sp);
-
+            ItemKind::Struct(ref struct_def, _) => {
                 // Define a name in the type namespace.
-                name_bindings.define_type(DefTy(local_def(item.id), false), sp, modifiers);
+                let def = Def::Struct(self.definitions.local_def_id(item.id));
+                self.define(parent, name, TypeNS, (def, sp, vis));
 
                 // If this is a newtype or unit-like struct, define a name
                 // in the value namespace as well
-                if let Some(cid) = ctor_id {
-                    name_bindings.define_value(DefStruct(local_def(cid)), sp, modifiers);
+                if !struct_def.is_struct() {
+                    let def = Def::Struct(self.definitions.local_def_id(struct_def.id()));
+                    self.define(parent, name, ValueNS, (def, sp, vis));
                 }
 
                 // Record the def ID and fields of this struct.
-                let named_fields = struct_def.fields.iter().filter_map(|f| {
-                    match f.node.kind {
-                        NamedField(ident, _) => Some(ident.name),
-                        UnnamedField(_) => None
-                    }
+                let field_names = struct_def.fields().iter().enumerate().map(|(index, field)| {
+                    self.resolve_visibility(&field.vis);
+                    field.ident.map(|ident| ident.name)
+                               .unwrap_or_else(|| token::intern(&index.to_string()))
                 }).collect();
-                self.structs.insert(local_def(item.id), named_fields);
-
-                parent.clone()
+                let item_def_id = self.definitions.local_def_id(item.id);
+                self.structs.insert(item_def_id, field_names);
             }
 
-            ItemDefaultImpl(_, _) |
-            ItemImpl(..) => parent.clone(),
+            ItemKind::DefaultImpl(_, _) | ItemKind::Impl(..) => {}
 
-            ItemTrait(_, _, _, ref items) => {
-                let name_bindings =
-                    self.add_child(name, parent, ForbidDuplicateTypesAndModules, sp);
+            ItemKind::Trait(_, _, _, ref items) => {
+                let def_id = self.definitions.local_def_id(item.id);
 
                 // Add all the items within to a new module.
-                let parent_link = self.get_parent_link(parent, name);
-                name_bindings.define_module(parent_link,
-                                            Some(local_def(item.id)),
-                                            TraitModuleKind,
-                                            false,
-                                            is_public,
-                                            sp);
-                let module_parent = name_bindings.get_module();
-
-                let def_id = local_def(item.id);
+                let parent_link = ModuleParentLink(parent, name);
+                let def = Def::Trait(def_id);
+                let module_parent = self.new_module(parent_link, Some(def), false);
+                self.define(parent, name, TypeNS, (module_parent, sp, vis));
 
                 // Add the names of all the items to the trait info.
-                for trait_item in items {
-                    let name_bindings = self.add_child(trait_item.ident.name,
-                                        &module_parent,
-                                        ForbidDuplicateTypesAndValues,
-                                        trait_item.span);
+                for item in items {
+                    let item_def_id = self.definitions.local_def_id(item.id);
+                    let mut is_static_method = false;
+                    let (def, ns) = match item.node {
+                        TraitItemKind::Const(..) => (Def::AssociatedConst(item_def_id), ValueNS),
+                        TraitItemKind::Method(ref sig, _) => {
+                            is_static_method = !sig.decl.has_self();
+                            (Def::Method(item_def_id), ValueNS)
+                        }
+                        TraitItemKind::Type(..) => (Def::AssociatedTy(def_id, item_def_id), TypeNS),
+                        TraitItemKind::Macro(_) => panic!("unexpanded macro in resolve!"),
+                    };
 
-                    match trait_item.node {
-                        ast::ConstTraitItem(..) => {
-                            let def = DefAssociatedConst(local_def(trait_item.id),
-                                                         FromTrait(local_def(item.id)));
-                            // NB: not DefModifiers::IMPORTABLE
-                            name_bindings.define_value(def, trait_item.span, DefModifiers::PUBLIC);
-                        }
-                        ast::MethodTraitItem(..) => {
-                            let def = DefMethod(local_def(trait_item.id),
-                                                FromTrait(local_def(item.id)));
-                            // NB: not DefModifiers::IMPORTABLE
-                            name_bindings.define_value(def, trait_item.span, DefModifiers::PUBLIC);
-                        }
-                        ast::TypeTraitItem(..) => {
-                            let def = DefAssociatedTy(local_def(item.id),
-                                                      local_def(trait_item.id));
-                            // NB: not DefModifiers::IMPORTABLE
-                            name_bindings.define_type(def, trait_item.span, DefModifiers::PUBLIC);
-                        }
-                    }
+                    self.define(module_parent, item.ident.name, ns, (def, item.span, vis));
 
-                    self.trait_item_map.insert((trait_item.ident.name, def_id),
-                                               local_def(trait_item.id));
+                    self.trait_item_map.insert((item.ident.name, def_id), is_static_method);
                 }
-
-                name_bindings.define_type(DefTrait(def_id), sp, modifiers);
-                parent.clone()
             }
-            ItemMac(..) => parent.clone()
+            ItemKind::Mac(_) => panic!("unexpanded macro in resolve!"),
         }
     }
 
@@ -582,425 +316,196 @@ impl<'a, 'b:'a, 'tcx:'b> GraphBuilder<'a, 'b, 'tcx> {
     fn build_reduced_graph_for_variant(&mut self,
                                        variant: &Variant,
                                        item_id: DefId,
-                                       parent: &Rc<Module>) {
+                                       parent: Module<'b>,
+                                       vis: ty::Visibility) {
         let name = variant.node.name.name;
-        let is_exported = match variant.node.kind {
-            TupleVariantKind(_) => false,
-            StructVariantKind(_) => {
-                // Not adding fields for variants as they are not accessed with a self receiver
-                self.structs.insert(local_def(variant.node.id), Vec::new());
-                true
-            }
-        };
+        if variant.node.data.is_struct() {
+            // Not adding fields for variants as they are not accessed with a self receiver
+            let variant_def_id = self.definitions.local_def_id(variant.node.data.id());
+            self.structs.insert(variant_def_id, Vec::new());
+        }
 
-        let child = self.add_child(name, parent,
-                                   ForbidDuplicateTypesAndValues,
-                                   variant.span);
-        // variants are always treated as importable to allow them to be glob
-        // used
-        child.define_value(DefVariant(item_id,
-                                      local_def(variant.node.id), is_exported),
-                           variant.span, DefModifiers::PUBLIC | DefModifiers::IMPORTABLE);
-        child.define_type(DefVariant(item_id,
-                                     local_def(variant.node.id), is_exported),
-                          variant.span, DefModifiers::PUBLIC | DefModifiers::IMPORTABLE);
+        // Variants are always treated as importable to allow them to be glob used.
+        // All variants are defined in both type and value namespaces as future-proofing.
+        let def = Def::Variant(item_id, self.definitions.local_def_id(variant.node.data.id()));
+        self.define(parent, name, ValueNS, (def, variant.span, vis));
+        self.define(parent, name, TypeNS, (def, variant.span, vis));
     }
 
     /// Constructs the reduced graph for one foreign item.
     fn build_reduced_graph_for_foreign_item(&mut self,
                                             foreign_item: &ForeignItem,
-                                            parent: &Rc<Module>) {
+                                            parent: Module<'b>) {
         let name = foreign_item.ident.name;
-        let is_public = foreign_item.vis == ast::Public;
-        let modifiers = if is_public {
-            DefModifiers::PUBLIC
-        } else {
-            DefModifiers::empty()
-        } | DefModifiers::IMPORTABLE;
-        let name_bindings =
-            self.add_child(name, parent, ForbidDuplicateValues,
-                           foreign_item.span);
 
         let def = match foreign_item.node {
-            ForeignItemFn(..) => {
-                DefFn(local_def(foreign_item.id), false)
+            ForeignItemKind::Fn(..) => {
+                Def::Fn(self.definitions.local_def_id(foreign_item.id))
             }
-            ForeignItemStatic(_, m) => {
-                DefStatic(local_def(foreign_item.id), m)
+            ForeignItemKind::Static(_, m) => {
+                Def::Static(self.definitions.local_def_id(foreign_item.id), m)
             }
         };
-        name_bindings.define_value(def, foreign_item.span, modifiers);
+        self.current_module = parent;
+        let vis = self.resolve_visibility(&foreign_item.vis);
+        self.define(parent, name, ValueNS, (def, foreign_item.span, vis));
     }
 
-    fn build_reduced_graph_for_block(&mut self, block: &Block, parent: &Rc<Module>) -> Rc<Module> {
+    fn build_reduced_graph_for_block(&mut self, block: &Block, parent: &mut Module<'b>) {
         if self.block_needs_anonymous_module(block) {
             let block_id = block.id;
 
-            debug!("(building reduced graph for block) creating a new \
-                    anonymous module for block {}",
+            debug!("(building reduced graph for block) creating a new anonymous module for block \
+                    {}",
                    block_id);
 
-            let new_module = Rc::new(Module::new(
-                BlockParentLink(parent.downgrade(), block_id),
-                None,
-                AnonymousModuleKind,
-                false,
-                false));
-            parent.anonymous_children.borrow_mut().insert(block_id, new_module.clone());
-            new_module
-        } else {
-            parent.clone()
-        }
-    }
-
-    fn handle_external_def(&mut self,
-                           def: Def,
-                           vis: Visibility,
-                           child_name_bindings: &NameBindings,
-                           final_ident: &str,
-                           name: Name,
-                           new_parent: &Rc<Module>) {
-        debug!("(building reduced graph for \
-                external crate) building external def {}, priv {:?}",
-               final_ident, vis);
-        let is_public = vis == ast::Public;
-        let modifiers = if is_public {
-            DefModifiers::PUBLIC
-        } else {
-            DefModifiers::empty()
-        } | DefModifiers::IMPORTABLE;
-        let is_exported = is_public && match new_parent.def_id.get() {
-            None => true,
-            Some(did) => self.external_exports.contains(&did)
-        };
-        if is_exported {
-            self.external_exports.insert(def.def_id());
-        }
-
-        let kind = match def {
-            DefTy(_, true) => EnumModuleKind,
-            DefTy(_, false) | DefStruct(..) => TypeModuleKind,
-            _ => NormalModuleKind
-        };
-
-        match def {
-          DefMod(def_id) | DefForeignMod(def_id) | DefStruct(def_id) |
-          DefTy(def_id, _) => {
-            let type_def = child_name_bindings.type_def.borrow().clone();
-            match type_def {
-              Some(TypeNsDef { module_def: Some(module_def), .. }) => {
-                debug!("(building reduced graph for external crate) \
-                        already created module");
-                module_def.def_id.set(Some(def_id));
-              }
-              Some(_) | None => {
-                debug!("(building reduced graph for \
-                        external crate) building module \
-                        {} {}", final_ident, is_public);
-                let parent_link = self.get_parent_link(new_parent, name);
-
-                child_name_bindings.define_module(parent_link,
-                                                  Some(def_id),
-                                                  kind,
-                                                  true,
-                                                  is_public,
-                                                  DUMMY_SP);
-              }
-            }
-          }
-          _ => {}
-        }
-
-        match def {
-          DefMod(_) | DefForeignMod(_) => {}
-          DefVariant(_, variant_id, is_struct) => {
-              debug!("(building reduced graph for external crate) building \
-                      variant {}",
-                      final_ident);
-              // variants are always treated as importable to allow them to be
-              // glob used
-              let modifiers = DefModifiers::PUBLIC | DefModifiers::IMPORTABLE;
-              if is_struct {
-                  child_name_bindings.define_type(def, DUMMY_SP, modifiers);
-                  // Not adding fields for variants as they are not accessed with a self receiver
-                  self.structs.insert(variant_id, Vec::new());
-              } else {
-                  child_name_bindings.define_value(def, DUMMY_SP, modifiers);
-              }
-          }
-          DefFn(ctor_id, true) => {
-            child_name_bindings.define_value(
-                csearch::get_tuple_struct_definition_if_ctor(&self.session.cstore, ctor_id)
-                    .map_or(def, |_| DefStruct(ctor_id)), DUMMY_SP, modifiers);
-          }
-          DefFn(..) | DefStatic(..) | DefConst(..) | DefAssociatedConst(..) |
-          DefMethod(..) => {
-            debug!("(building reduced graph for external \
-                    crate) building value (fn/static) {}", final_ident);
-            // impl methods have already been defined with the correct importability modifier
-            let mut modifiers = match *child_name_bindings.value_def.borrow() {
-                Some(ref def) => (modifiers & !DefModifiers::IMPORTABLE) |
-                             (def.modifiers &  DefModifiers::IMPORTABLE),
-                None => modifiers
-            };
-            if new_parent.kind.get() != NormalModuleKind {
-                modifiers = modifiers & !DefModifiers::IMPORTABLE;
-            }
-            child_name_bindings.define_value(def, DUMMY_SP, modifiers);
-          }
-          DefTrait(def_id) => {
-              debug!("(building reduced graph for external \
-                      crate) building type {}", final_ident);
-
-              // If this is a trait, add all the trait item names to the trait
-              // info.
-
-              let trait_item_def_ids =
-                csearch::get_trait_item_def_ids(&self.session.cstore, def_id);
-              for trait_item_def in &trait_item_def_ids {
-                  let trait_item_name = csearch::get_trait_name(&self.session.cstore,
-                                                                trait_item_def.def_id());
-
-                  debug!("(building reduced graph for external crate) ... \
-                          adding trait item '{}'",
-                         token::get_name(trait_item_name));
-
-                  self.trait_item_map.insert((trait_item_name, def_id),
-                                             trait_item_def.def_id());
-
-                  if is_exported {
-                      self.external_exports.insert(trait_item_def.def_id());
-                  }
-              }
-
-              child_name_bindings.define_type(def, DUMMY_SP, modifiers);
-
-              // Define a module if necessary.
-              let parent_link = self.get_parent_link(new_parent, name);
-              child_name_bindings.set_module_kind(parent_link,
-                                                  Some(def_id),
-                                                  TraitModuleKind,
-                                                  true,
-                                                  is_public,
-                                                  DUMMY_SP)
-          }
-          DefTy(..) | DefAssociatedTy(..) => {
-              debug!("(building reduced graph for external \
-                      crate) building type {}", final_ident);
-
-              child_name_bindings.define_type(def, DUMMY_SP, modifiers);
-          }
-          DefStruct(def_id) => {
-            debug!("(building reduced graph for external \
-                    crate) building type and value for {}",
-                   final_ident);
-            child_name_bindings.define_type(def, DUMMY_SP, modifiers);
-            let fields = csearch::get_struct_fields(&self.session.cstore, def_id).iter().map(|f| {
-                f.name
-            }).collect::<Vec<_>>();
-
-            if fields.is_empty() {
-                child_name_bindings.define_value(def, DUMMY_SP, modifiers);
-            }
-
-            // Record the def ID and fields of this struct.
-            self.structs.insert(def_id, fields);
-          }
-          DefLocal(..) | DefPrimTy(..) | DefTyParam(..) |
-          DefUse(..) | DefUpvar(..) | DefRegion(..) |
-          DefLabel(..) | DefSelfTy(..) => {
-            panic!("didn't expect `{:?}`", def);
-          }
+            let parent_link = BlockParentLink(parent, block_id);
+            let new_module = self.new_module(parent_link, None, false);
+            self.module_map.insert(block_id, new_module);
+            *parent = new_module;
         }
     }
 
     /// Builds the reduced graph for a single item in an external crate.
-    fn build_reduced_graph_for_external_crate_def(&mut self,
-                                                  root: &Rc<Module>,
-                                                  def_like: DefLike,
-                                                  name: Name,
-                                                  def_visibility: Visibility) {
-        match def_like {
-            DlDef(def) => {
-                // Add the new child item, if necessary.
-                match def {
-                    DefForeignMod(def_id) => {
-                        // Foreign modules have no names. Recur and populate
-                        // eagerly.
-                        csearch::each_child_of_item(&self.session.cstore,
-                                                    def_id,
-                                                    |def_like,
-                                                     child_name,
-                                                     vis| {
-                            self.build_reduced_graph_for_external_crate_def(
-                                root,
-                                def_like,
-                                child_name,
-                                vis)
-                        });
-                    }
-                    _ => {
-                        let child_name_bindings =
-                            self.add_child(name,
-                                           root,
-                                           OverwriteDuplicates,
-                                           DUMMY_SP);
-
-                        self.handle_external_def(def,
-                                                 def_visibility,
-                                                 &*child_name_bindings,
-                                                 &token::get_name(name),
-                                                 name,
-                                                 root);
-                    }
-                }
-            }
-            DlImpl(_) => {
-                debug!("(building reduced graph for external crate) \
-                        ignoring impl");
-            }
-            DlField => {
-                debug!("(building reduced graph for external crate) \
-                        ignoring field");
-            }
-        }
-    }
-
-    /// Builds the reduced graph rooted at the given external module.
-    fn populate_external_module(&mut self, module: &Rc<Module>) {
-        debug!("(populating external module) attempting to populate {}",
-               module_to_string(&**module));
-
-        let def_id = match module.def_id.get() {
-            None => {
-                debug!("(populating external module) ... no def ID!");
-                return
-            }
-            Some(def_id) => def_id,
+    fn build_reduced_graph_for_external_crate_def(&mut self, parent: Module<'b>, xcdef: ChildItem) {
+        let def = match xcdef.def {
+            DlDef(def) => def,
+            _ => return,
         };
 
-        csearch::each_child_of_item(&self.session.cstore,
-                                    def_id,
-                                    |def_like, child_name, visibility| {
-            debug!("(populating external module) ... found ident: {}",
-                   token::get_name(child_name));
-            self.build_reduced_graph_for_external_crate_def(module,
-                                                            def_like,
-                                                            child_name,
-                                                            visibility)
-        });
-        module.populated.set(true)
-    }
-
-    /// Ensures that the reduced graph rooted at the given external module
-    /// is built, building it if it is not.
-    fn populate_module_if_necessary(&mut self, module: &Rc<Module>) {
-        if !module.populated.get() {
-            self.populate_external_module(module)
+        if let Def::ForeignMod(def_id) = def {
+            // Foreign modules have no names. Recur and populate eagerly.
+            for child in self.session.cstore.item_children(def_id) {
+                self.build_reduced_graph_for_external_crate_def(parent, child);
+            }
+            return;
         }
-        assert!(module.populated.get())
+
+        let name = xcdef.name;
+        let vis = if parent.is_trait() { ty::Visibility::Public } else { xcdef.vis };
+
+        match def {
+            Def::Mod(_) | Def::ForeignMod(_) | Def::Enum(..) => {
+                debug!("(building reduced graph for external crate) building module {} {:?}",
+                       name, vis);
+                let parent_link = ModuleParentLink(parent, name);
+                let module = self.new_module(parent_link, Some(def), true);
+                let _ = self.try_define(parent, name, TypeNS, (module, DUMMY_SP, vis));
+            }
+            Def::Variant(_, variant_id) => {
+                debug!("(building reduced graph for external crate) building variant {}", name);
+                // Variants are always treated as importable to allow them to be glob used.
+                // All variants are defined in both type and value namespaces as future-proofing.
+                let _ = self.try_define(parent, name, TypeNS, (def, DUMMY_SP, vis));
+                let _ = self.try_define(parent, name, ValueNS, (def, DUMMY_SP, vis));
+                if self.session.cstore.variant_kind(variant_id) == Some(VariantKind::Struct) {
+                    // Not adding fields for variants as they are not accessed with a self receiver
+                    self.structs.insert(variant_id, Vec::new());
+                }
+            }
+            Def::Fn(..) |
+            Def::Static(..) |
+            Def::Const(..) |
+            Def::AssociatedConst(..) |
+            Def::Method(..) => {
+                debug!("(building reduced graph for external crate) building value (fn/static) {}",
+                       name);
+                let _ = self.try_define(parent, name, ValueNS, (def, DUMMY_SP, vis));
+            }
+            Def::Trait(def_id) => {
+                debug!("(building reduced graph for external crate) building type {}", name);
+
+                // If this is a trait, add all the trait item names to the trait
+                // info.
+
+                let trait_item_def_ids = self.session.cstore.trait_item_def_ids(def_id);
+                for trait_item_def in &trait_item_def_ids {
+                    let trait_item_name =
+                        self.session.cstore.item_name(trait_item_def.def_id());
+
+                    debug!("(building reduced graph for external crate) ... adding trait item \
+                            '{}'",
+                           trait_item_name);
+
+                    self.trait_item_map.insert((trait_item_name, def_id), false);
+                }
+
+                let parent_link = ModuleParentLink(parent, name);
+                let module = self.new_module(parent_link, Some(def), true);
+                let _ = self.try_define(parent, name, TypeNS, (module, DUMMY_SP, vis));
+            }
+            Def::TyAlias(..) | Def::AssociatedTy(..) => {
+                debug!("(building reduced graph for external crate) building type {}", name);
+                let _ = self.try_define(parent, name, TypeNS, (def, DUMMY_SP, vis));
+            }
+            Def::Struct(def_id)
+                if self.session.cstore.tuple_struct_definition_if_ctor(def_id).is_none() => {
+                debug!("(building reduced graph for external crate) building type and value for {}",
+                       name);
+                let _ = self.try_define(parent, name, TypeNS, (def, DUMMY_SP, vis));
+                if let Some(ctor_def_id) = self.session.cstore.struct_ctor_def_id(def_id) {
+                    let def = Def::Struct(ctor_def_id);
+                    let _ = self.try_define(parent, name, ValueNS, (def, DUMMY_SP, vis));
+                }
+
+                // Record the def ID and fields of this struct.
+                let fields = self.session.cstore.struct_field_names(def_id);
+                self.structs.insert(def_id, fields);
+            }
+            Def::Struct(..) => {}
+            Def::Local(..) |
+            Def::PrimTy(..) |
+            Def::TyParam(..) |
+            Def::Upvar(..) |
+            Def::Label(..) |
+            Def::SelfTy(..) |
+            Def::Err => {
+                bug!("didn't expect `{:?}`", def);
+            }
+        }
     }
 
     /// Builds the reduced graph rooted at the 'use' directive for an external
     /// crate.
-    fn build_reduced_graph_for_external_crate(&mut self, root: &Rc<Module>) {
-        csearch::each_top_level_item_of_crate(&self.session.cstore,
-                                              root.def_id
-                                                  .get()
-                                                  .unwrap()
-                                                  .krate,
-                                              |def_like, name, visibility| {
-            self.build_reduced_graph_for_external_crate_def(root, def_like, name, visibility)
-        });
-    }
-
-    /// Creates and adds an import directive to the given module.
-    fn build_import_directive(&mut self,
-                              module_: &Module,
-                              module_path: Vec<Name>,
-                              subclass: ImportDirectiveSubclass,
-                              span: Span,
-                              id: NodeId,
-                              is_public: bool,
-                              shadowable: Shadowable) {
-        module_.imports.borrow_mut().push(ImportDirective::new(module_path,
-                                                               subclass,
-                                                               span,
-                                                               id,
-                                                               is_public,
-                                                               shadowable));
-        self.unresolved_imports += 1;
-        // Bump the reference count on the name. Or, if this is a glob, set
-        // the appropriate flag.
-
-        match subclass {
-            SingleImport(target, _) => {
-                debug!("(building import directive) building import directive: {}::{}",
-                       names_to_string(&module_.imports.borrow().last().unwrap().module_path),
-                       token::get_name(target));
-
-                let mut import_resolutions = module_.import_resolutions.borrow_mut();
-                match import_resolutions.get_mut(&target) {
-                    Some(resolution) => {
-                        debug!("(building import directive) bumping reference");
-                        resolution.outstanding_references += 1;
-
-                        // the source of this name is different now
-                        resolution.type_id = id;
-                        resolution.value_id = id;
-                        resolution.is_public = is_public;
-                        return;
-                    }
-                    None => {}
-                }
-                debug!("(building import directive) creating new");
-                let mut resolution = ImportResolution::new(id, is_public);
-                resolution.outstanding_references = 1;
-                import_resolutions.insert(target, resolution);
-            }
-            GlobImport => {
-                // Set the glob flag. This tells us that we don't know the
-                // module's exports ahead of time.
-
-                module_.glob_count.set(module_.glob_count.get() + 1);
-            }
+    fn build_reduced_graph_for_external_crate(&mut self, root: Module<'b>) {
+        let root_cnum = root.def_id().unwrap().krate;
+        for child in self.session.cstore.crate_top_level_items(root_cnum) {
+            self.build_reduced_graph_for_external_crate_def(root, child);
         }
     }
+
+    /// Ensures that the reduced graph rooted at the given external module
+    /// is built, building it if it is not.
+    pub fn populate_module_if_necessary(&mut self, module: Module<'b>) {
+        if module.populated.get() { return }
+        for child in self.session.cstore.item_children(module.def_id().unwrap()) {
+            self.build_reduced_graph_for_external_crate_def(module, child);
+        }
+        module.populated.set(true)
+    }
 }
 
-struct BuildReducedGraphVisitor<'a, 'b:'a, 'tcx:'b> {
-    builder: GraphBuilder<'a, 'b, 'tcx>,
-    parent: Rc<Module>
+struct BuildReducedGraphVisitor<'a, 'b: 'a> {
+    resolver: &'a mut Resolver<'b>,
+    parent: Module<'b>,
 }
 
-impl<'a, 'b, 'v, 'tcx> Visitor<'v> for BuildReducedGraphVisitor<'a, 'b, 'tcx> {
+impl<'a, 'b> Visitor for BuildReducedGraphVisitor<'a, 'b> {
     fn visit_item(&mut self, item: &Item) {
-        let p = self.builder.build_reduced_graph_for_item(item, &self.parent);
-        let old_parent = replace(&mut self.parent, p);
+        let old_parent = self.parent;
+        self.resolver.build_reduced_graph_for_item(item, &mut self.parent);
         visit::walk_item(self, item);
         self.parent = old_parent;
     }
 
     fn visit_foreign_item(&mut self, foreign_item: &ForeignItem) {
-        self.builder.build_reduced_graph_for_foreign_item(foreign_item, &self.parent);
+        self.resolver.build_reduced_graph_for_foreign_item(foreign_item, &self.parent);
     }
 
     fn visit_block(&mut self, block: &Block) {
-        let np = self.builder.build_reduced_graph_for_block(block, &self.parent);
-        let old_parent = replace(&mut self.parent, np);
+        let old_parent = self.parent;
+        self.resolver.build_reduced_graph_for_block(block, &mut self.parent);
         visit::walk_block(self, block);
         self.parent = old_parent;
     }
-}
-
-pub fn build_reduced_graph(resolver: &mut Resolver, krate: &ast::Crate) {
-    GraphBuilder {
-        resolver: resolver
-    }.build_reduced_graph(krate);
-}
-
-pub fn populate_module_if_necessary(resolver: &mut Resolver, module: &Rc<Module>) {
-    GraphBuilder {
-        resolver: resolver
-    }.populate_module_if_necessary(module);
 }

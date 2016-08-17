@@ -8,11 +8,13 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
+// compile-flags: -Z continue-parse-after-error
+
 struct Self;
 //~^ ERROR expected identifier, found keyword `Self`
 
 struct Bar<'Self>;
-//~^ ERROR invalid lifetime name
+//~^ ERROR lifetimes cannot use keyword names
 
 pub fn main() {
     let Self = 5;
@@ -29,15 +31,13 @@ pub fn main() {
         //~^ ERROR expected identifier, found keyword `Self`
         Self!() => (),
         //~^ ERROR expected identifier, found keyword `Self`
+        //~^^ ERROR macro undefined: 'Self!'
         Foo { x: Self } => (),
         //~^ ERROR expected identifier, found keyword `Self`
         Foo { Self } => (),
         //~^ ERROR expected identifier, found keyword `Self`
     }
 }
-
-use self::Self as Foo;
-//~^ ERROR expected identifier, found keyword `Self`
 
 use std::option::Option as Self;
 //~^ ERROR expected identifier, found keyword `Self`

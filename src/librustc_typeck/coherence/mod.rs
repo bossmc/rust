@@ -15,104 +15,98 @@
 // done by the orphan and overlap modules. Then we build up various
 // mappings. That mapping code resides here.
 
-
+use hir::def_id::DefId;
 use middle::lang_items::UnsizeTraitLangItem;
-use middle::subst::{self, Subst};
-use middle::traits;
-use middle::ty::RegionEscape;
-use middle::ty::{ImplContainer, ImplOrTraitItemId, ConstTraitItemId};
-use middle::ty::{MethodTraitItemId, TypeTraitItemId, ParameterEnvironment};
-use middle::ty::{Ty, TyBool, TyChar, TyEnum, TyError};
-use middle::ty::{TyParam, TypeScheme, TyRawPtr};
-use middle::ty::{TyRef, TyStruct, TyTrait, TyTuple};
-use middle::ty::{TyStr, TyArray, TySlice, TyFloat, TyInfer, TyInt};
-use middle::ty::{TyUint, TyClosure, TyBox, TyBareFn};
-use middle::ty::TyProjection;
-use middle::ty;
+use rustc::ty::subst::Subst;
+use rustc::ty::{self, TyCtxt, TypeFoldable};
+use rustc::traits::{self, Reveal};
+use rustc::ty::{ImplOrTraitItemId, ConstTraitItemId};
+use rustc::ty::{MethodTraitItemId, TypeTraitItemId, ParameterEnvironment};
+use rustc::ty::{Ty, TyBool, TyChar, TyEnum, TyError};
+use rustc::ty::{TyParam, TyRawPtr};
+use rustc::ty::{TyRef, TyStruct, TyTrait, TyNever, TyTuple};
+use rustc::ty::{TyStr, TyArray, TySlice, TyFloat, TyInfer, TyInt};
+use rustc::ty::{TyUint, TyClosure, TyBox, TyFnDef, TyFnPtr};
+use rustc::ty::{TyProjection, TyAnon};
+use rustc::ty::util::CopyImplementationError;
 use middle::free_region::FreeRegionMap;
 use CrateCtxt;
-use middle::infer::{self, InferCtxt, new_infer_ctxt};
-use rustc::ast_map::{self, NodeItem};
+use rustc::infer::{self, InferCtxt, TypeOrigin};
 use std::cell::RefCell;
 use std::rc::Rc;
-use syntax::ast::{Crate, DefId};
-use syntax::ast::{Item, ItemImpl};
-use syntax::ast::{LOCAL_CRATE};
-use syntax::ast;
-use syntax::ast_util::local_def;
-use syntax::codemap::Span;
-use syntax::parse::token;
-use syntax::visit;
+use syntax_pos::Span;
 use util::nodemap::{DefIdMap, FnvHashMap};
+use rustc::dep_graph::DepNode;
+use rustc::hir::map as hir_map;
+use rustc::hir::intravisit;
+use rustc::hir::{Item, ItemImpl};
+use rustc::hir;
 
 mod orphan;
 mod overlap;
 mod unsafety;
 
-// Returns the def ID of the base type, if there is one.
-fn get_base_type_def_id<'a, 'tcx>(inference_context: &InferCtxt<'a, 'tcx>,
-                                  span: Span,
-                                  ty: Ty<'tcx>)
-                                  -> Option<DefId> {
-    match ty.sty {
-        TyEnum(def_id, _) |
-        TyStruct(def_id, _) => {
-            Some(def_id)
-        }
-
-        TyTrait(ref t) => {
-            Some(t.principal_def_id())
-        }
-
-        TyBox(_) => {
-            inference_context.tcx.lang_items.owned_box()
-        }
-
-        TyBool | TyChar | TyInt(..) | TyUint(..) | TyFloat(..) |
-        TyStr(..) | TyArray(..) | TySlice(..) | TyBareFn(..) | TyTuple(..) |
-        TyParam(..) | TyError |
-        TyRawPtr(_) | TyRef(_, _) | TyProjection(..) => {
-            None
-        }
-
-        TyInfer(..) | TyClosure(..) => {
-            // `ty` comes from a user declaration so we should only expect types
-            // that the user can type
-            inference_context.tcx.sess.span_bug(
-                span,
-                &format!("coherence encountered unexpected type searching for base type: {}",
-                         ty));
-        }
-    }
+struct CoherenceChecker<'a, 'gcx: 'a+'tcx, 'tcx: 'a> {
+    crate_context: &'a CrateCtxt<'a, 'gcx>,
+    inference_context: InferCtxt<'a, 'gcx, 'tcx>,
+    inherent_impls: RefCell<DefIdMap<Rc<RefCell<Vec<DefId>>>>>,
 }
 
-struct CoherenceChecker<'a, 'tcx: 'a> {
-    crate_context: &'a CrateCtxt<'a, 'tcx>,
-    inference_context: InferCtxt<'a, 'tcx>,
-    inherent_impls: RefCell<DefIdMap<Rc<RefCell<Vec<ast::DefId>>>>>,
+struct CoherenceCheckVisitor<'a, 'gcx: 'a+'tcx, 'tcx: 'a> {
+    cc: &'a CoherenceChecker<'a, 'gcx, 'tcx>
 }
 
-struct CoherenceCheckVisitor<'a, 'tcx: 'a> {
-    cc: &'a CoherenceChecker<'a, 'tcx>
-}
-
-impl<'a, 'tcx, 'v> visit::Visitor<'v> for CoherenceCheckVisitor<'a, 'tcx> {
+impl<'a, 'gcx, 'tcx, 'v> intravisit::Visitor<'v> for CoherenceCheckVisitor<'a, 'gcx, 'tcx> {
     fn visit_item(&mut self, item: &Item) {
         if let ItemImpl(..) = item.node {
             self.cc.check_implementation(item)
         }
-
-        visit::walk_item(self, item);
     }
 }
 
-impl<'a, 'tcx> CoherenceChecker<'a, 'tcx> {
-    fn check(&self, krate: &Crate) {
+impl<'a, 'gcx, 'tcx> CoherenceChecker<'a, 'gcx, 'tcx> {
+
+    // Returns the def ID of the base type, if there is one.
+    fn get_base_type_def_id(&self, span: Span, ty: Ty<'tcx>) -> Option<DefId> {
+        match ty.sty {
+            TyEnum(def, _) |
+            TyStruct(def, _) => {
+                Some(def.did)
+            }
+
+            TyTrait(ref t) => {
+                Some(t.principal.def_id())
+            }
+
+            TyBox(_) => {
+                self.inference_context.tcx.lang_items.owned_box()
+            }
+
+            TyBool | TyChar | TyInt(..) | TyUint(..) | TyFloat(..) |
+            TyStr | TyArray(..) | TySlice(..) | TyFnDef(..) | TyFnPtr(_) |
+            TyTuple(..) | TyParam(..) | TyError | TyNever |
+            TyRawPtr(_) | TyRef(_, _) | TyProjection(..) => {
+                None
+            }
+
+            TyInfer(..) | TyClosure(..) | TyAnon(..) => {
+                // `ty` comes from a user declaration so we should only expect types
+                // that the user can type
+                span_bug!(
+                    span,
+                    "coherence encountered unexpected type searching for base type: {}",
+                    ty);
+            }
+        }
+    }
+
+    fn check(&self) {
         // Check implementations and traits. This populates the tables
         // containing the inherent methods and extension methods. It also
         // builds up the trait inheritance table.
-        let mut visitor = CoherenceCheckVisitor { cc: self };
-        visit::walk_crate(&mut visitor, krate);
+        self.crate_context.tcx.visit_all_items_in_krate(
+            DepNode::CoherenceCheckImpl,
+            &mut CoherenceCheckVisitor { cc: self });
 
         // Copy over the inherent impls we gathered up during the walk into
         // the tcx.
@@ -126,7 +120,7 @@ impl<'a, 'tcx> CoherenceChecker<'a, 'tcx> {
         // Populate the table of destructors. It might seem a bit strange to
         // do this here, but it's actually the most convenient place, since
         // the coherence tables contain the trait -> type mappings.
-        self.populate_destructor_table();
+        self.populate_destructors();
 
         // Check to make sure implementations of `Copy` are legal.
         self.check_implementations_of_copy();
@@ -138,7 +132,7 @@ impl<'a, 'tcx> CoherenceChecker<'a, 'tcx> {
 
     fn check_implementation(&self, item: &Item) {
         let tcx = self.crate_context.tcx;
-        let impl_did = local_def(item.id);
+        let impl_did = tcx.map.local_def_id(item.id);
         let self_type = tcx.lookup_item_type(impl_did);
 
         // If there are no traits, then this implementation must have a
@@ -149,91 +143,40 @@ impl<'a, 'tcx> CoherenceChecker<'a, 'tcx> {
         if let Some(trait_ref) = self.crate_context.tcx.impl_trait_ref(impl_did) {
             debug!("(checking implementation) adding impl for trait '{:?}', item '{}'",
                    trait_ref,
-                   item.ident);
+                   item.name);
+
+            // Skip impls where one of the self type is an error type.
+            // This occurs with e.g. resolve failures (#30589).
+            if trait_ref.references_error() {
+                return;
+            }
 
             enforce_trait_manually_implementable(self.crate_context.tcx,
                                                  item.span,
                                                  trait_ref.def_id);
             self.add_trait_impl(trait_ref, impl_did);
         } else {
+            // Skip inherent impls where the self type is an error
+            // type. This occurs with e.g. resolve failures (#30589).
+            if self_type.ty.references_error() {
+                return;
+            }
+
             // Add the implementation to the mapping from implementation to base
             // type def ID, if there is a base type for this implementation and
             // the implementation does not have any associated traits.
-            if let Some(base_type_def_id) = get_base_type_def_id(
-                    &self.inference_context, item.span, self_type.ty) {
-                self.add_inherent_impl(base_type_def_id, impl_did);
+            if let Some(base_def_id) = self.get_base_type_def_id(item.span, self_type.ty) {
+                self.add_inherent_impl(base_def_id, impl_did);
             }
         }
 
         tcx.impl_items.borrow_mut().insert(impl_did, impl_items);
     }
 
-    // Creates default method IDs and performs type substitutions for an impl
-    // and trait pair. Then, for each provided method in the trait, inserts a
-    // `ProvidedMethodInfo` instance into the `provided_method_sources` map.
-    fn instantiate_default_methods(
-            &self,
-            impl_id: DefId,
-            trait_ref: &ty::TraitRef<'tcx>,
-            all_impl_items: &mut Vec<ImplOrTraitItemId>) {
-        let tcx = self.crate_context.tcx;
-        debug!("instantiate_default_methods(impl_id={:?}, trait_ref={:?})",
-               impl_id, trait_ref);
-
-        let impl_type_scheme = tcx.lookup_item_type(impl_id);
-
-        let prov = tcx.provided_trait_methods(trait_ref.def_id);
-        for trait_method in &prov {
-            // Synthesize an ID.
-            let new_id = tcx.sess.next_node_id();
-            let new_did = local_def(new_id);
-
-            debug!("new_did={:?} trait_method={:?}", new_did, trait_method);
-
-            // Create substitutions for the various trait parameters.
-            let new_method_ty =
-                Rc::new(subst_receiver_types_in_method_ty(
-                    tcx,
-                    impl_id,
-                    &impl_type_scheme,
-                    trait_ref,
-                    new_did,
-                    &**trait_method,
-                    Some(trait_method.def_id)));
-
-            debug!("new_method_ty={:?}", new_method_ty);
-            all_impl_items.push(MethodTraitItemId(new_did));
-
-            // construct the polytype for the method based on the
-            // method_ty.  it will have all the generics from the
-            // impl, plus its own.
-            let new_polytype = ty::TypeScheme {
-                generics: new_method_ty.generics.clone(),
-                ty: tcx.mk_fn(Some(new_did),
-                              tcx.mk_bare_fn(new_method_ty.fty.clone()))
-            };
-            debug!("new_polytype={:?}", new_polytype);
-
-            tcx.register_item_type(new_did, new_polytype);
-            tcx.predicates.borrow_mut().insert(new_did, new_method_ty.predicates.clone());
-            tcx.impl_or_trait_items
-               .borrow_mut()
-               .insert(new_did, ty::MethodTraitItem(new_method_ty));
-
-            // Pair the new synthesized ID up with the
-            // ID of the method.
-            self.crate_context.tcx.provided_method_sources.borrow_mut()
-                .insert(new_did, trait_method.def_id);
-        }
-    }
-
     fn add_inherent_impl(&self, base_def_id: DefId, impl_def_id: DefId) {
-        match self.inherent_impls.borrow().get(&base_def_id) {
-            Some(implementation_list) => {
-                implementation_list.borrow_mut().push(impl_def_id);
-                return;
-            }
-            None => {}
+        if let Some(implementation_list) = self.inherent_impls.borrow().get(&base_def_id) {
+            implementation_list.borrow_mut().push(impl_def_id);
+            return;
         }
 
         self.inherent_impls.borrow_mut().insert(
@@ -241,47 +184,34 @@ impl<'a, 'tcx> CoherenceChecker<'a, 'tcx> {
             Rc::new(RefCell::new(vec!(impl_def_id))));
     }
 
-    fn add_trait_impl(&self, impl_trait_ref: ty::TraitRef<'tcx>, impl_def_id: DefId) {
+    fn add_trait_impl(&self, impl_trait_ref: ty::TraitRef<'gcx>, impl_def_id: DefId) {
         debug!("add_trait_impl: impl_trait_ref={:?} impl_def_id={:?}",
                impl_trait_ref, impl_def_id);
         let trait_def = self.crate_context.tcx.lookup_trait_def(impl_trait_ref.def_id);
-        trait_def.record_impl(self.crate_context.tcx, impl_def_id, impl_trait_ref);
+        trait_def.record_local_impl(self.crate_context.tcx, impl_def_id, impl_trait_ref);
     }
 
     // Converts an implementation in the AST to a vector of items.
     fn create_impl_from_item(&self, item: &Item) -> Vec<ImplOrTraitItemId> {
         match item.node {
             ItemImpl(_, _, _, _, _, ref impl_items) => {
-                let mut items: Vec<ImplOrTraitItemId> =
-                        impl_items.iter().map(|impl_item| {
+                impl_items.iter().map(|impl_item| {
+                    let impl_def_id = self.crate_context.tcx.map.local_def_id(impl_item.id);
                     match impl_item.node {
-                        ast::ConstImplItem(..) => {
-                            ConstTraitItemId(local_def(impl_item.id))
+                        hir::ImplItemKind::Const(..) => {
+                            ConstTraitItemId(impl_def_id)
                         }
-                        ast::MethodImplItem(..) => {
-                            MethodTraitItemId(local_def(impl_item.id))
+                        hir::ImplItemKind::Method(..) => {
+                            MethodTraitItemId(impl_def_id)
                         }
-                        ast::TypeImplItem(_) => {
-                            TypeTraitItemId(local_def(impl_item.id))
-                        }
-                        ast::MacImplItem(_) => {
-                            self.crate_context.tcx.sess.span_bug(impl_item.span,
-                                                                 "unexpanded macro");
+                        hir::ImplItemKind::Type(_) => {
+                            TypeTraitItemId(impl_def_id)
                         }
                     }
-                }).collect();
-
-                let def_id = local_def(item.id);
-                if let Some(trait_ref) = self.crate_context.tcx.impl_trait_ref(def_id) {
-                    self.instantiate_default_methods(def_id, &trait_ref, &mut items);
-                }
-
-                items
+                }).collect()
             }
             _ => {
-                self.crate_context.tcx.sess.span_bug(item.span,
-                                                     "can't convert a non-impl \
-                                                      to an impl");
+                span_bug!(item.span, "can't convert a non-impl to an impl");
             }
         }
     }
@@ -290,7 +220,7 @@ impl<'a, 'tcx> CoherenceChecker<'a, 'tcx> {
     // Destructors
     //
 
-    fn populate_destructor_table(&self) {
+    fn populate_destructors(&self) {
         let tcx = self.crate_context.tcx;
         let drop_trait = match tcx.lang_items.drop_trait() {
             Some(id) => id, None => { return }
@@ -310,34 +240,34 @@ impl<'a, 'tcx> CoherenceChecker<'a, 'tcx> {
 
             let self_type = tcx.lookup_item_type(impl_did);
             match self_type.ty.sty {
-                ty::TyEnum(type_def_id, _) |
-                ty::TyStruct(type_def_id, _) |
-                ty::TyClosure(type_def_id, _) => {
-                    tcx.destructor_for_type
-                       .borrow_mut()
-                       .insert(type_def_id, method_def_id.def_id());
-                    tcx.destructors
-                       .borrow_mut()
-                       .insert(method_def_id.def_id());
+                ty::TyEnum(type_def, _) |
+                ty::TyStruct(type_def, _) => {
+                    type_def.set_destructor(method_def_id.def_id());
                 }
                 _ => {
                     // Destructors only work on nominal types.
-                    if impl_did.krate == ast::LOCAL_CRATE {
-                        {
-                            match tcx.map.find(impl_did.node) {
-                                Some(ast_map::NodeItem(item)) => {
-                                    span_err!(tcx.sess, item.span, E0120,
-                                        "the Drop trait may only be implemented on structures");
-                                }
-                                _ => {
-                                    tcx.sess.bug("didn't find impl in ast \
-                                                  map");
-                                }
+                    if let Some(impl_node_id) = tcx.map.as_local_node_id(impl_did) {
+                        match tcx.map.find(impl_node_id) {
+                            Some(hir_map::NodeItem(item)) => {
+                                let span = match item.node {
+                                    ItemImpl(_, _, _, _, ref ty, _) => {
+                                        ty.span
+                                    },
+                                    _ => item.span
+                                };
+                                struct_span_err!(tcx.sess, span, E0120,
+                                    "the Drop trait may only be implemented on structures")
+                                    .span_label(span,
+                                                &format!("implementing Drop requires a struct"))
+                                    .emit();
+                            }
+                            _ => {
+                                bug!("didn't find impl in ast map");
                             }
                         }
                     } else {
-                        tcx.sess.bug("found external impl of Drop trait on \
-                                      something other than a struct");
+                        bug!("found external impl of Drop trait on \
+                              something other than a struct");
                     }
                 }
             }
@@ -358,47 +288,66 @@ impl<'a, 'tcx> CoherenceChecker<'a, 'tcx> {
             debug!("check_implementations_of_copy: impl_did={:?}",
                    impl_did);
 
-            if impl_did.krate != ast::LOCAL_CRATE {
+            let impl_node_id = if let Some(n) = tcx.map.as_local_node_id(impl_did) {
+                n
+            } else {
                 debug!("check_implementations_of_copy(): impl not in this \
                         crate");
                 return
-            }
+            };
 
             let self_type = tcx.lookup_item_type(impl_did);
             debug!("check_implementations_of_copy: self_type={:?} (bound)",
                    self_type);
 
-            let span = tcx.map.span(impl_did.node);
-            let param_env = ParameterEnvironment::for_item(tcx, impl_did.node);
+            let span = tcx.map.span(impl_node_id);
+            let param_env = ParameterEnvironment::for_item(tcx, impl_node_id);
             let self_type = self_type.ty.subst(tcx, &param_env.free_substs);
             assert!(!self_type.has_escaping_regions());
 
             debug!("check_implementations_of_copy: self_type={:?} (free)",
                    self_type);
 
-            match param_env.can_type_implement_copy(self_type, span) {
+            match param_env.can_type_implement_copy(tcx, self_type, span) {
                 Ok(()) => {}
-                Err(ty::FieldDoesNotImplementCopy(name)) => {
-                       span_err!(tcx.sess, span, E0204,
-                                 "the trait `Copy` may not be \
-                                          implemented for this type; field \
-                                          `{}` does not implement `Copy`",
-                                         token::get_name(name))
+                Err(CopyImplementationError::InfrigingField(name)) => {
+                       struct_span_err!(tcx.sess, span, E0204,
+                                 "the trait `Copy` may not be implemented for \
+                                 this type")
+                           .span_label(span, &format!(
+                                 "field `{}` does not implement `Copy`", name)
+                               )
+                           .emit()
+
                 }
-                Err(ty::VariantDoesNotImplementCopy(name)) => {
-                       span_err!(tcx.sess, span, E0205,
-                                 "the trait `Copy` may not be \
-                                          implemented for this type; variant \
-                                          `{}` does not implement `Copy`",
-                                         token::get_name(name))
+                Err(CopyImplementationError::InfrigingVariant(name)) => {
+                    let item = tcx.map.expect_item(impl_node_id);
+                    let span = if let ItemImpl(_, _, _, Some(ref tr), _, _) = item.node {
+                        tr.path.span
+                    } else {
+                        span
+                    };
+
+                    struct_span_err!(tcx.sess, span, E0205,
+                                     "the trait `Copy` may not be implemented for this type")
+                        .span_label(span, &format!("variant `{}` does not implement `Copy`",
+                                                   name))
+                        .emit()
                 }
-                Err(ty::TypeIsStructural) => {
-                       span_err!(tcx.sess, span, E0206,
-                                 "the trait `Copy` may not be implemented \
-                                  for this type; type is not a structure or \
-                                  enumeration")
+                Err(CopyImplementationError::NotAnAdt) => {
+                    let item = tcx.map.expect_item(impl_node_id);
+                    let span = if let ItemImpl(_, _, _, _, ref ty, _) = item.node {
+                        ty.span
+                    } else {
+                        span
+                    };
+
+                    struct_span_err!(tcx.sess, span, E0206,
+                                     "the trait `Copy` may not be implemented for this type")
+                        .span_label(span, &format!("type is not a structure or enumeration"))
+                        .emit();
                 }
-                Err(ty::TypeHasDestructor) => {
+                Err(CopyImplementationError::HasDestructor) => {
                     span_err!(tcx.sess, span, E0184,
                               "the trait `Copy` may not be implemented for this type; \
                                the type has a destructor");
@@ -427,20 +376,22 @@ impl<'a, 'tcx> CoherenceChecker<'a, 'tcx> {
             debug!("check_implementations_of_coerce_unsized: impl_did={:?}",
                    impl_did);
 
-            if impl_did.krate != ast::LOCAL_CRATE {
+            let impl_node_id = if let Some(n) = tcx.map.as_local_node_id(impl_did) {
+                n
+            } else {
                 debug!("check_implementations_of_coerce_unsized(): impl not \
                         in this crate");
                 return;
-            }
+            };
 
             let source = tcx.lookup_item_type(impl_did).ty;
             let trait_ref = self.crate_context.tcx.impl_trait_ref(impl_did).unwrap();
-            let target = *trait_ref.substs.types.get(subst::TypeSpace, 0);
+            let target = trait_ref.substs.types[1];
             debug!("check_implementations_of_coerce_unsized: {:?} -> {:?} (bound)",
                    source, target);
 
-            let span = tcx.map.span(impl_did.node);
-            let param_env = ParameterEnvironment::for_item(tcx, impl_did.node);
+            let span = tcx.map.span(impl_node_id);
+            let param_env = ParameterEnvironment::for_item(tcx, impl_node_id);
             let source = source.subst(tcx, &param_env.free_substs);
             let target = target.subst(tcx, &param_env.free_substs);
             assert!(!source.has_escaping_regions());
@@ -448,116 +399,128 @@ impl<'a, 'tcx> CoherenceChecker<'a, 'tcx> {
             debug!("check_implementations_of_coerce_unsized: {:?} -> {:?} (free)",
                    source, target);
 
-            let infcx = new_infer_ctxt(tcx, &tcx.tables, Some(param_env), true);
+            tcx.infer_ctxt(None, Some(param_env), Reveal::ExactMatch).enter(|infcx| {
+                let origin = TypeOrigin::Misc(span);
+                let check_mutbl = |mt_a: ty::TypeAndMut<'gcx>, mt_b: ty::TypeAndMut<'gcx>,
+                                   mk_ptr: &Fn(Ty<'gcx>) -> Ty<'gcx>| {
+                    if (mt_a.mutbl, mt_b.mutbl) == (hir::MutImmutable, hir::MutMutable) {
+                        infcx.report_mismatched_types(origin, mk_ptr(mt_b.ty),
+                                                      target, ty::error::TypeError::Mutability);
+                    }
+                    (mt_a.ty, mt_b.ty, unsize_trait, None)
+                };
+                let (source, target, trait_def_id, kind) = match (&source.sty, &target.sty) {
+                    (&ty::TyBox(a), &ty::TyBox(b)) => (a, b, unsize_trait, None),
 
-            let check_mutbl = |mt_a: ty::TypeAndMut<'tcx>, mt_b: ty::TypeAndMut<'tcx>,
-                               mk_ptr: &Fn(Ty<'tcx>) -> Ty<'tcx>| {
-                if (mt_a.mutbl, mt_b.mutbl) == (ast::MutImmutable, ast::MutMutable) {
-                    infcx.report_mismatched_types(span, mk_ptr(mt_b.ty),
-                                                  target, &ty::TypeError::Mutability);
-                }
-                (mt_a.ty, mt_b.ty, unsize_trait, None)
-            };
-            let (source, target, trait_def_id, kind) = match (&source.sty, &target.sty) {
-                (&ty::TyBox(a), &ty::TyBox(b)) => (a, b, unsize_trait, None),
-
-                (&ty::TyRef(r_a, mt_a), &ty::TyRef(r_b, mt_b)) => {
-                    infer::mk_subr(&infcx, infer::RelateObjectBound(span), *r_b, *r_a);
-                    check_mutbl(mt_a, mt_b, &|ty| tcx.mk_imm_ref(r_b, ty))
-                }
-
-                (&ty::TyRef(_, mt_a), &ty::TyRawPtr(mt_b)) |
-                (&ty::TyRawPtr(mt_a), &ty::TyRawPtr(mt_b)) => {
-                    check_mutbl(mt_a, mt_b, &|ty| tcx.mk_imm_ptr(ty))
-                }
-
-                (&ty::TyStruct(def_id_a, substs_a), &ty::TyStruct(def_id_b, substs_b)) => {
-                    if def_id_a != def_id_b {
-                        let source_path = tcx.item_path_str(def_id_a);
-                        let target_path = tcx.item_path_str(def_id_b);
-                        span_err!(tcx.sess, span, E0377,
-                                  "the trait `CoerceUnsized` may only be implemented \
-                                   for a coercion between structures with the same \
-                                   definition; expected {}, found {}",
-                                  source_path, target_path);
-                        return;
+                    (&ty::TyRef(r_a, mt_a), &ty::TyRef(r_b, mt_b)) => {
+                        infcx.sub_regions(infer::RelateObjectBound(span), *r_b, *r_a);
+                        check_mutbl(mt_a, mt_b, &|ty| tcx.mk_imm_ref(r_b, ty))
                     }
 
-                    let origin = infer::Misc(span);
-                    let fields = tcx.lookup_struct_fields(def_id_a);
-                    let diff_fields = fields.iter().enumerate().filter_map(|(i, f)| {
-                        let ty = tcx.lookup_field_type_unsubstituted(def_id_a, f.id);
-                        let (a, b) = (ty.subst(tcx, substs_a), ty.subst(tcx, substs_b));
-                        if infcx.sub_types(false, origin, b, a).is_ok() {
-                            None
-                        } else {
-                            Some((i, a, b))
+                    (&ty::TyRef(_, mt_a), &ty::TyRawPtr(mt_b)) |
+                    (&ty::TyRawPtr(mt_a), &ty::TyRawPtr(mt_b)) => {
+                        check_mutbl(mt_a, mt_b, &|ty| tcx.mk_imm_ptr(ty))
+                    }
+
+                    (&ty::TyStruct(def_a, substs_a), &ty::TyStruct(def_b, substs_b)) => {
+                        if def_a != def_b {
+                            let source_path = tcx.item_path_str(def_a.did);
+                            let target_path = tcx.item_path_str(def_b.did);
+                            span_err!(tcx.sess, span, E0377,
+                                      "the trait `CoerceUnsized` may only be implemented \
+                                       for a coercion between structures with the same \
+                                       definition; expected {}, found {}",
+                                      source_path, target_path);
+                            return;
                         }
-                    }).collect::<Vec<_>>();
 
-                    if diff_fields.is_empty() {
-                        span_err!(tcx.sess, span, E0374,
-                                  "the trait `CoerceUnsized` may only be implemented \
-                                   for a coercion between structures with one field \
-                                   being coerced, none found");
-                        return;
-                    } else if diff_fields.len() > 1 {
-                        span_err!(tcx.sess, span, E0375,
-                                  "the trait `CoerceUnsized` may only be implemented \
-                                   for a coercion between structures with one field \
-                                   being coerced, but {} fields need coercions: {}",
-                                   diff_fields.len(), diff_fields.iter().map(|&(i, a, b)| {
-                                        let name = fields[i].name;
-                                        format!("{} ({} to {})",
-                                                if name == token::special_names::unnamed_field {
-                                                    i.to_string()
-                                                } else {
-                                                    name.to_string()
-                                                }, a, b)
-                                   }).collect::<Vec<_>>().join(", "));
-                        return;
+                        let fields = &def_a.struct_variant().fields;
+                        let diff_fields = fields.iter().enumerate().filter_map(|(i, f)| {
+                            let (a, b) = (f.ty(tcx, substs_a), f.ty(tcx, substs_b));
+
+                            if f.unsubst_ty().is_phantom_data() {
+                                // Ignore PhantomData fields
+                                None
+                            } else if infcx.sub_types(false, origin, b, a).is_ok() {
+                                // Ignore fields that aren't significantly changed
+                                None
+                            } else {
+                                // Collect up all fields that were significantly changed
+                                // i.e. those that contain T in coerce_unsized T -> U
+                                Some((i, a, b))
+                            }
+                        }).collect::<Vec<_>>();
+
+                        if diff_fields.is_empty() {
+                            span_err!(tcx.sess, span, E0374,
+                                      "the trait `CoerceUnsized` may only be implemented \
+                                       for a coercion between structures with one field \
+                                       being coerced, none found");
+                            return;
+                        } else if diff_fields.len() > 1 {
+                            let item = tcx.map.expect_item(impl_node_id);
+                            let span = if let ItemImpl(_, _, _, Some(ref t), _, _) = item.node {
+                                t.path.span
+                            } else {
+                                tcx.map.span(impl_node_id)
+                            };
+
+                            let mut err = struct_span_err!(tcx.sess, span, E0375,
+                                      "implementing the trait `CoerceUnsized` \
+                                       requires multiple coercions");
+                            err.note("`CoerceUnsized` may only be implemented for \
+                                      a coercion between structures with one field being coerced");
+                            err.note(&format!("currently, {} fields need coercions: {}",
+                                             diff_fields.len(),
+                                             diff_fields.iter().map(|&(i, a, b)| {
+                                                format!("{} ({} to {})", fields[i].name, a, b)
+                                             }).collect::<Vec<_>>().join(", ") ));
+                            err.span_label(span, &format!("requires multiple coercions"));
+                            err.emit();
+                            return;
+                        }
+
+                        let (i, a, b) = diff_fields[0];
+                        let kind = ty::adjustment::CustomCoerceUnsized::Struct(i);
+                        (a, b, coerce_unsized_trait, Some(kind))
                     }
 
-                    let (i, a, b) = diff_fields[0];
-                    let kind = ty::CustomCoerceUnsized::Struct(i);
-                    (a, b, coerce_unsized_trait, Some(kind))
+                    _ => {
+                        span_err!(tcx.sess, span, E0376,
+                                  "the trait `CoerceUnsized` may only be implemented \
+                                   for a coercion between structures");
+                        return;
+                    }
+                };
+
+                let mut fulfill_cx = traits::FulfillmentContext::new();
+
+                // Register an obligation for `A: Trait<B>`.
+                let cause = traits::ObligationCause::misc(span, impl_node_id);
+                let predicate = tcx.predicate_for_trait_def(cause, trait_def_id, 0,
+                                                            source, vec![target]);
+                fulfill_cx.register_predicate_obligation(&infcx, predicate);
+
+                // Check that all transitive obligations are satisfied.
+                if let Err(errors) = fulfill_cx.select_all_or_error(&infcx) {
+                    infcx.report_fulfillment_errors(&errors);
                 }
 
-                _ => {
-                    span_err!(tcx.sess, span, E0376,
-                              "the trait `CoerceUnsized` may only be implemented \
-                               for a coercion between structures");
-                    return;
+                // Finally, resolve all regions.
+                let mut free_regions = FreeRegionMap::new();
+                free_regions.relate_free_regions_from_predicates(
+                    &infcx.parameter_environment.caller_bounds);
+                infcx.resolve_regions_and_report_errors(&free_regions, impl_node_id);
+
+                if let Some(kind) = kind {
+                    tcx.custom_coerce_unsized_kinds.borrow_mut().insert(impl_did, kind);
                 }
-            };
-
-            let mut fulfill_cx = infcx.fulfillment_cx.borrow_mut();
-
-            // Register an obligation for `A: Trait<B>`.
-            let cause = traits::ObligationCause::misc(span, impl_did.node);
-            let predicate = traits::predicate_for_trait_def(tcx, cause, trait_def_id,
-                                                            0, source, vec![target]);
-            fulfill_cx.register_predicate_obligation(&infcx, predicate);
-
-            // Check that all transitive obligations are satisfied.
-            if let Err(errors) = fulfill_cx.select_all_or_error(&infcx) {
-                traits::report_fulfillment_errors(&infcx, &errors);
-            }
-
-            // Finally, resolve all regions.
-            let mut free_regions = FreeRegionMap::new();
-            free_regions.relate_free_regions_from_predicates(tcx, &infcx.parameter_environment
-                                                                        .caller_bounds);
-            infcx.resolve_regions_and_report_errors(&free_regions, impl_did.node);
-
-            if let Some(kind) = kind {
-                tcx.custom_coerce_unsized_kinds.borrow_mut().insert(impl_did, kind);
-            }
+            });
         });
     }
 }
 
-fn enforce_trait_manually_implementable(tcx: &ty::ctxt, sp: Span, trait_def_id: ast::DefId) {
+fn enforce_trait_manually_implementable(tcx: TyCtxt, sp: Span, trait_def_id: DefId) {
     if tcx.sess.features.borrow().unboxed_closures {
         // the feature gate allows all of them
         return
@@ -574,67 +537,25 @@ fn enforce_trait_manually_implementable(tcx: &ty::ctxt, sp: Span, trait_def_id: 
     } else {
         return // everything OK
     };
-    span_err!(tcx.sess, sp, E0183, "manual implementations of `{}` are experimental", trait_name);
-    fileline_help!(tcx.sess, sp,
-               "add `#![feature(unboxed_closures)]` to the crate attributes to enable");
+    let mut err = struct_span_err!(tcx.sess,
+                                   sp,
+                                   E0183,
+                                   "manual implementations of `{}` are experimental",
+                                   trait_name);
+    help!(&mut err, "add `#![feature(unboxed_closures)]` to the crate attributes to enable");
+    err.emit();
 }
 
-fn subst_receiver_types_in_method_ty<'tcx>(tcx: &ty::ctxt<'tcx>,
-                                           impl_id: ast::DefId,
-                                           impl_type_scheme: &ty::TypeScheme<'tcx>,
-                                           trait_ref: &ty::TraitRef<'tcx>,
-                                           new_def_id: ast::DefId,
-                                           method: &ty::Method<'tcx>,
-                                           provided_source: Option<ast::DefId>)
-                                           -> ty::Method<'tcx>
-{
-    let combined_substs = tcx.make_substs_for_receiver_types(trait_ref, method);
-
-    debug!("subst_receiver_types_in_method_ty: combined_substs={:?}",
-           combined_substs);
-
-    let method_predicates = method.predicates.subst(tcx, &combined_substs);
-    let mut method_generics = method.generics.subst(tcx, &combined_substs);
-
-    // replace the type parameters declared on the trait with those
-    // from the impl
-    for &space in &[subst::TypeSpace, subst::SelfSpace] {
-        method_generics.types.replace(
-            space,
-            impl_type_scheme.generics.types.get_slice(space).to_vec());
-        method_generics.regions.replace(
-            space,
-            impl_type_scheme.generics.regions.get_slice(space).to_vec());
-    }
-
-    debug!("subst_receiver_types_in_method_ty: method_generics={:?}",
-           method_generics);
-
-    let method_fty = method.fty.subst(tcx, &combined_substs);
-
-    debug!("subst_receiver_types_in_method_ty: method_ty={:?}",
-           method.fty);
-
-    ty::Method::new(
-        method.name,
-        method_generics,
-        method_predicates,
-        method_fty,
-        method.explicit_self,
-        method.vis,
-        new_def_id,
-        ImplContainer(impl_id),
-        provided_source
-    )
-}
-
-pub fn check_coherence(crate_context: &CrateCtxt) {
-    CoherenceChecker {
-        crate_context: crate_context,
-        inference_context: new_infer_ctxt(crate_context.tcx, &crate_context.tcx.tables, None, true),
-        inherent_impls: RefCell::new(FnvHashMap()),
-    }.check(crate_context.tcx.map.krate());
-    unsafety::check(crate_context.tcx);
-    orphan::check(crate_context.tcx);
-    overlap::check(crate_context.tcx);
+pub fn check_coherence(ccx: &CrateCtxt) {
+    let _task = ccx.tcx.dep_graph.in_task(DepNode::Coherence);
+    ccx.tcx.infer_ctxt(None, None, Reveal::ExactMatch).enter(|infcx| {
+        CoherenceChecker {
+            crate_context: ccx,
+            inference_context: infcx,
+            inherent_impls: RefCell::new(FnvHashMap()),
+        }.check();
+    });
+    unsafety::check(ccx.tcx);
+    orphan::check(ccx.tcx);
+    overlap::check(ccx.tcx);
 }

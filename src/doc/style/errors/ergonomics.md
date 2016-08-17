@@ -9,7 +9,7 @@ pattern.
 
 Prefer
 
-```rust
+```rust,ignore
 use std::io::{File, Open, Write, IoError};
 
 struct Info {
@@ -31,7 +31,7 @@ fn write_info(info: &Info) -> Result<(), IoError> {
 
 over
 
-```rust
+```rust,ignore
 use std::io::{File, Open, Write, IoError};
 
 struct Info {
@@ -57,7 +57,7 @@ fn write_info(info: &Info) -> Result<(), IoError> {
 ```
 
 See
-[the `result` module documentation](http://static.rust-lang.org/doc/master/std/result/index.html#the-try!-macro)
+[the `result` module documentation](https://doc.rust-lang.org/stable/std/result/index.html#the-try-macro)
 for more details.
 
 ### The `Result`-`impl` pattern [FIXME]

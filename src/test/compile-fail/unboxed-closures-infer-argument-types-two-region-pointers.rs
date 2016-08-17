@@ -11,8 +11,6 @@
 // That a closure whose expected argument types include two distinct
 // bound regions.
 
-#![feature(unboxed_closures)]
-
 use std::cell::Cell;
 
 fn doit<T,F>(val: T, f: &F)
@@ -24,6 +22,6 @@ fn doit<T,F>(val: T, f: &F)
 
 pub fn main() {
     doit(0, &|x, y| {
-        x.set(y); //~ ERROR cannot infer
+        x.set(y); //~ ERROR E0312
     });
 }

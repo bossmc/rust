@@ -12,7 +12,6 @@
 //! use. This implementation is not intended for external use or for any use where security is
 //! important.
 
-use std::slice::bytes::{MutableByteVector, copy_memory};
 use serialize::hex::ToHex;
 
 /// Write a u32 into a vector, which must be 4 bytes long. The value is written in big-endian
@@ -26,11 +25,10 @@ fn write_u32_be(dst: &mut[u8], input: u32) {
 
 /// Read the value of a vector of bytes as a u32 value in big-endian format.
 fn read_u32_be(input: &[u8]) -> u32 {
-    return
-        (input[0] as u32) << 24 |
+    (input[0] as u32) << 24 |
         (input[1] as u32) << 16 |
         (input[2] as u32) << 8 |
-        (input[3] as u32);
+        (input[3] as u32)
 }
 
 /// Read a vector of bytes into a vector of u32s. The values are read in big-endian format.
@@ -43,7 +41,7 @@ fn read_u32v_be(dst: &mut[u32], input: &[u8]) {
     }
 }
 
-trait ToBits {
+trait ToBits: Sized {
     /// Convert the value in bytes to the number of bits, a tuple where the 1st item is the
     /// high-order value and the 2nd item is the low order value.
     fn to_bits(self) -> (Self, Self);
@@ -51,7 +49,7 @@ trait ToBits {
 
 impl ToBits for u64 {
     fn to_bits(self) -> (u64, u64) {
-        return (self >> 61, self << 3);
+        (self >> 61, self << 3)
     }
 }
 
@@ -65,7 +63,7 @@ fn add_bytes_to_bits(bits: u64, bytes: u64) -> u64 {
     }
 
     match bits.checked_add(new_low_bits) {
-        Some(x) => return x,
+        Some(x) => x,
         None => panic!("numeric overflow occurred.")
     }
 }
@@ -114,10 +112,10 @@ struct FixedBuffer64 {
 impl FixedBuffer64 {
     /// Create a new FixedBuffer64
     fn new() -> FixedBuffer64 {
-        return FixedBuffer64 {
+        FixedBuffer64 {
             buffer: [0; 64],
             buffer_idx: 0
-        };
+        }
     }
 }
 
@@ -134,16 +132,14 @@ impl FixedBuffer for FixedBuffer64 {
         if self.buffer_idx != 0 {
             let buffer_remaining = size - self.buffer_idx;
             if input.len() >= buffer_remaining {
-                    copy_memory(
-                        &input[..buffer_remaining],
-                        &mut self.buffer[self.buffer_idx..size]);
+                self.buffer[self.buffer_idx..size]
+                    .copy_from_slice(&input[..buffer_remaining]);
                 self.buffer_idx = 0;
                 func(&self.buffer);
                 i += buffer_remaining;
             } else {
-                copy_memory(
-                    input,
-                    &mut self.buffer[self.buffer_idx..self.buffer_idx + input.len()]);
+                self.buffer[self.buffer_idx..self.buffer_idx + input.len()]
+                    .copy_from_slice(input);
                 self.buffer_idx += input.len();
                 return;
             }
@@ -160,9 +156,7 @@ impl FixedBuffer for FixedBuffer64 {
         // data left in the input vector will be less than the buffer size and the buffer will
         // be empty.
         let input_remaining = input.len() - i;
-        copy_memory(
-            &input[i..],
-            &mut self.buffer[..input_remaining]);
+        self.buffer[..input_remaining].copy_from_slice(&input[i..]);
         self.buffer_idx += input_remaining;
     }
 
@@ -172,19 +166,21 @@ impl FixedBuffer for FixedBuffer64 {
 
     fn zero_until(&mut self, idx: usize) {
         assert!(idx >= self.buffer_idx);
-        self.buffer[self.buffer_idx..idx].set_memory(0);
+        for slot in self.buffer[self.buffer_idx..idx].iter_mut() {
+            *slot = 0;
+        }
         self.buffer_idx = idx;
     }
 
     fn next<'s>(&'s mut self, len: usize) -> &'s mut [u8] {
         self.buffer_idx += len;
-        return &mut self.buffer[self.buffer_idx - len..self.buffer_idx];
+        &mut self.buffer[self.buffer_idx - len..self.buffer_idx]
     }
 
     fn full_buffer<'s>(&'s mut self) -> &'s [u8] {
         assert!(self.buffer_idx == 64);
         self.buffer_idx = 0;
-        return &self.buffer[..64];
+        &self.buffer[..64]
     }
 
     fn position(&self) -> usize { self.buffer_idx }
@@ -281,7 +277,7 @@ struct Engine256State {
 
 impl Engine256State {
     fn new(h: &[u32; 8]) -> Engine256State {
-        return Engine256State {
+        Engine256State {
             h0: h[0],
             h1: h[1],
             h2: h[2],
@@ -290,7 +286,7 @@ impl Engine256State {
             h5: h[5],
             h6: h[6],
             h7: h[7]
-        };
+        }
     }
 
     fn reset(&mut self, h: &[u32; 8]) {
@@ -436,7 +432,7 @@ struct Engine256 {
 
 impl Engine256 {
     fn new(h: &[u32; 8]) -> Engine256 {
-        return Engine256 {
+        Engine256 {
             length_bits: 0,
             buffer: FixedBuffer64::new(),
             state: Engine256State::new(h),
@@ -460,17 +456,15 @@ impl Engine256 {
     }
 
     fn finish(&mut self) {
-        if self.finished {
-            return;
+        if !self.finished {
+            let self_state = &mut self.state;
+            self.buffer.standard_padding(8, |input: &[u8]| { self_state.process_block(input) });
+            write_u32_be(self.buffer.next(4), (self.length_bits >> 32) as u32 );
+            write_u32_be(self.buffer.next(4), self.length_bits as u32);
+            self_state.process_block(self.buffer.full_buffer());
+
+            self.finished = true;
         }
-
-        let self_state = &mut self.state;
-        self.buffer.standard_padding(8, |input: &[u8]| { self_state.process_block(input) });
-        write_u32_be(self.buffer.next(4), (self.length_bits >> 32) as u32 );
-        write_u32_be(self.buffer.next(4), self.length_bits as u32);
-        self_state.process_block(self.buffer.full_buffer());
-
-        self.finished = true;
     }
 }
 
@@ -534,7 +528,7 @@ mod tests {
     use self::rand::isaac::IsaacRng;
     use serialize::hex::FromHex;
     use std::u64;
-    use super::{Digest, Sha256, FixedBuffer};
+    use super::{Digest, Sha256};
 
     // A normal addition - no overflow occurs
     #[test]
@@ -651,7 +645,7 @@ mod tests {
 mod bench {
     extern crate test;
     use self::test::Bencher;
-    use super::{Sha256, FixedBuffer, Digest};
+    use super::{Sha256, Digest};
 
     #[bench]
     pub fn sha256_10(b: &mut Bencher) {

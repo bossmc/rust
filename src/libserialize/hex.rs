@@ -30,7 +30,8 @@ impl ToHex for [u8] {
     /// # Examples
     ///
     /// ```
-    /// # #![feature(rustc_private)]
+    /// #![feature(rustc_private)]
+    ///
     /// extern crate serialize;
     /// use serialize::hex::ToHex;
     ///
@@ -100,7 +101,8 @@ impl FromHex for str {
     /// This converts a string literal to hexadecimal and back.
     ///
     /// ```
-    /// # #![feature(rustc_private)]
+    /// #![feature(rustc_private)]
+    ///
     /// extern crate serialize;
     /// use serialize::hex::{FromHex, ToHex};
     ///
@@ -130,7 +132,10 @@ impl FromHex for str {
                     buf >>= 4;
                     continue
                 }
-                _ => return Err(InvalidHexCharacter(self.char_at(idx), idx)),
+                _ => {
+                    let ch = self[idx..].chars().next().unwrap();
+                    return Err(InvalidHexCharacter(ch, idx))
+                }
             }
 
             modulus += 1;

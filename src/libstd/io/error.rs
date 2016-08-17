@@ -17,9 +17,8 @@ use option::Option::{self, Some, None};
 use result;
 use sys;
 
-/// A specialized [`Result`][result] type for I/O operations.
-///
-/// [result]: ../result/enum.Result.html
+/// A specialized [`Result`](../result/enum.Result.html) type for I/O
+/// operations.
 ///
 /// This type is broadly used across `std::io` for any operation which may
 /// produce an error.
@@ -56,7 +55,9 @@ pub type Result<T> = result::Result<T, Error>;
 ///
 /// Errors mostly originate from the underlying OS, but custom instances of
 /// `Error` can be created with crafted error messages and a particular value of
-/// `ErrorKind`.
+/// [`ErrorKind`].
+///
+/// [`ErrorKind`]: enum.ErrorKind.html
 #[derive(Debug)]
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct Error {
@@ -78,8 +79,13 @@ struct Custom {
 ///
 /// This list is intended to grow over time and it is not recommended to
 /// exhaustively match against it.
+///
+/// It is used with the [`io::Error`] type.
+///
+/// [`io::Error`]: struct.Error.html
 #[derive(Copy, PartialEq, Eq, Clone, Debug)]
 #[stable(feature = "rust1", since = "1.0.0")]
+#[allow(deprecated)]
 pub enum ErrorKind {
     /// An entity was not found, often a file.
     #[stable(feature = "rust1", since = "1.0.0")]
@@ -125,6 +131,9 @@ pub enum ErrorKind {
     /// Unlike `InvalidInput`, this typically means that the operation
     /// parameters were valid, however the error was caused by malformed
     /// input data.
+    ///
+    /// For example, a function that reads a file into a string will error with
+    /// `InvalidData` if the file's contents are not valid UTF-8.
     #[stable(feature = "io_invalid_data", since = "1.2.0")]
     InvalidData,
     /// The I/O operation's timeout expired, causing it to be canceled.
@@ -147,10 +156,20 @@ pub enum ErrorKind {
     #[stable(feature = "rust1", since = "1.0.0")]
     Other,
 
+    /// An error returned when an operation could not be completed because an
+    /// "end of file" was reached prematurely.
+    ///
+    /// This typically means that an operation could only succeed if it read a
+    /// particular number of bytes but only a smaller number of bytes could be
+    /// read.
+    #[stable(feature = "read_exact", since = "1.6.0")]
+    UnexpectedEof,
+
     /// Any I/O error not part of this list.
     #[unstable(feature = "io_error_internals",
                reason = "better expressed through extensible enums that this \
-                         enum cannot be exhaustively matched against")]
+                         enum cannot be exhaustively matched against",
+               issue = "0")]
     #[doc(hidden)]
     __Nonexhaustive,
 }
@@ -178,10 +197,14 @@ impl Error {
     pub fn new<E>(kind: ErrorKind, error: E) -> Error
         where E: Into<Box<error::Error+Send+Sync>>
     {
+        Self::_new(kind, error.into())
+    }
+
+    fn _new(kind: ErrorKind, error: Box<error::Error+Send+Sync>) -> Error {
         Error {
             repr: Repr::Custom(Box::new(Custom {
                 kind: kind,
-                error: error.into(),
+                error: error,
             }))
         }
     }
@@ -191,12 +214,44 @@ impl Error {
     /// This function reads the value of `errno` for the target platform (e.g.
     /// `GetLastError` on Windows) and will return a corresponding instance of
     /// `Error` for the error code.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::Error;
+    ///
+    /// println!("last OS error: {:?}", Error::last_os_error());
+    /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn last_os_error() -> Error {
         Error::from_raw_os_error(sys::os::errno() as i32)
     }
 
     /// Creates a new instance of an `Error` from a particular OS error code.
+    ///
+    /// # Examples
+    ///
+    /// On Linux:
+    ///
+    /// ```
+    /// # if cfg!(target_os = "linux") {
+    /// use std::io;
+    ///
+    /// let error = io::Error::from_raw_os_error(98);
+    /// assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+    /// # }
+    /// ```
+    ///
+    /// On Windows:
+    ///
+    /// ```
+    /// # if cfg!(windows) {
+    /// use std::io;
+    ///
+    /// let error = io::Error::from_raw_os_error(10048);
+    /// assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+    /// # }
+    /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn from_raw_os_error(code: i32) -> Error {
         Error { repr: Repr::Os(code) }
@@ -207,6 +262,27 @@ impl Error {
     /// If this `Error` was constructed via `last_os_error` or
     /// `from_raw_os_error`, then this function will return `Some`, otherwise
     /// it will return `None`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::{Error, ErrorKind};
+    ///
+    /// fn print_os_error(err: &Error) {
+    ///     if let Some(raw_os_err) = err.raw_os_error() {
+    ///         println!("raw OS error: {:?}", raw_os_err);
+    ///     } else {
+    ///         println!("Not an OS error");
+    ///     }
+    /// }
+    ///
+    /// fn main() {
+    ///     // Will print "raw OS error: ...".
+    ///     print_os_error(&Error::last_os_error());
+    ///     // Will print "Not an OS error".
+    ///     print_os_error(&Error::new(ErrorKind::Other, "oh no!"));
+    /// }
+    /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn raw_os_error(&self) -> Option<i32> {
         match self.repr {
@@ -219,8 +295,28 @@ impl Error {
     ///
     /// If this `Error` was constructed via `new` then this function will
     /// return `Some`, otherwise it will return `None`.
-    #[unstable(feature = "io_error_inner",
-               reason = "recently added and requires UFCS to downcast")]
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::{Error, ErrorKind};
+    ///
+    /// fn print_error(err: &Error) {
+    ///     if let Some(inner_err) = err.get_ref() {
+    ///         println!("Inner error: {:?}", inner_err);
+    ///     } else {
+    ///         println!("No inner error");
+    ///     }
+    /// }
+    ///
+    /// fn main() {
+    ///     // Will print "No inner error".
+    ///     print_error(&Error::last_os_error());
+    ///     // Will print "Inner error: ...".
+    ///     print_error(&Error::new(ErrorKind::Other, "oh no!"));
+    /// }
+    /// ```
+    #[stable(feature = "io_error_inner", since = "1.3.0")]
     pub fn get_ref(&self) -> Option<&(error::Error+Send+Sync+'static)> {
         match self.repr {
             Repr::Os(..) => None,
@@ -233,8 +329,64 @@ impl Error {
     ///
     /// If this `Error` was constructed via `new` then this function will
     /// return `Some`, otherwise it will return `None`.
-    #[unstable(feature = "io_error_inner",
-               reason = "recently added and requires UFCS to downcast")]
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::{Error, ErrorKind};
+    /// use std::{error, fmt};
+    /// use std::fmt::Display;
+    ///
+    /// #[derive(Debug)]
+    /// struct MyError {
+    ///     v: String,
+    /// }
+    ///
+    /// impl MyError {
+    ///     fn new() -> MyError {
+    ///         MyError {
+    ///             v: "oh no!".to_owned()
+    ///         }
+    ///     }
+    ///
+    ///     fn change_message(&mut self, new_message: &str) {
+    ///         self.v = new_message.to_owned();
+    ///     }
+    /// }
+    ///
+    /// impl error::Error for MyError {
+    ///     fn description(&self) -> &str { &self.v }
+    /// }
+    ///
+    /// impl Display for MyError {
+    ///     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    ///         write!(f, "MyError: {}", &self.v)
+    ///     }
+    /// }
+    ///
+    /// fn change_error(mut err: Error) -> Error {
+    ///     if let Some(inner_err) = err.get_mut() {
+    ///         inner_err.downcast_mut::<MyError>().unwrap().change_message("I've been changed!");
+    ///     }
+    ///     err
+    /// }
+    ///
+    /// fn print_error(err: &Error) {
+    ///     if let Some(inner_err) = err.get_ref() {
+    ///         println!("Inner error: {}", inner_err);
+    ///     } else {
+    ///         println!("No inner error");
+    ///     }
+    /// }
+    ///
+    /// fn main() {
+    ///     // Will print "No inner error".
+    ///     print_error(&change_error(Error::last_os_error()));
+    ///     // Will print "Inner error: ...".
+    ///     print_error(&change_error(Error::new(ErrorKind::Other, MyError::new())));
+    /// }
+    /// ```
+    #[stable(feature = "io_error_inner", since = "1.3.0")]
     pub fn get_mut(&mut self) -> Option<&mut (error::Error+Send+Sync+'static)> {
         match self.repr {
             Repr::Os(..) => None,
@@ -246,8 +398,28 @@ impl Error {
     ///
     /// If this `Error` was constructed via `new` then this function will
     /// return `Some`, otherwise it will return `None`.
-    #[unstable(feature = "io_error_inner",
-               reason = "recently added and requires UFCS to downcast")]
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::{Error, ErrorKind};
+    ///
+    /// fn print_error(err: Error) {
+    ///     if let Some(inner_err) = err.into_inner() {
+    ///         println!("Inner error: {}", inner_err);
+    ///     } else {
+    ///         println!("No inner error");
+    ///     }
+    /// }
+    ///
+    /// fn main() {
+    ///     // Will print "No inner error".
+    ///     print_error(Error::last_os_error());
+    ///     // Will print "Inner error: ...".
+    ///     print_error(Error::new(ErrorKind::Other, "oh no!"));
+    /// }
+    /// ```
+    #[stable(feature = "io_error_inner", since = "1.3.0")]
     pub fn into_inner(self) -> Option<Box<error::Error+Send+Sync>> {
         match self.repr {
             Repr::Os(..) => None,
@@ -256,6 +428,23 @@ impl Error {
     }
 
     /// Returns the corresponding `ErrorKind` for this error.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::{Error, ErrorKind};
+    ///
+    /// fn print_error(err: Error) {
+    ///     println!("{:?}", err.kind());
+    /// }
+    ///
+    /// fn main() {
+    ///     // Will print "No inner error".
+    ///     print_error(Error::last_os_error());
+    ///     // Will print "Inner error: ...".
+    ///     print_error(Error::new(ErrorKind::AddrInUse, "oh no!"));
+    /// }
+    /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn kind(&self) -> ErrorKind {
         match self.repr {
@@ -267,11 +456,11 @@ impl Error {
 
 impl fmt::Debug for Repr {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            &Repr::Os(ref code) =>
+        match *self {
+            Repr::Os(ref code) =>
                 fmt.debug_struct("Os").field("code", code)
                    .field("message", &sys::os::error_string(*code)).finish(),
-            &Repr::Custom(ref c) => fmt.debug_tuple("Custom").field(c).finish(),
+            Repr::Custom(ref c) => fmt.debug_tuple("Custom").field(c).finish(),
         }
     }
 }
@@ -293,7 +482,27 @@ impl fmt::Display for Error {
 impl error::Error for Error {
     fn description(&self) -> &str {
         match self.repr {
-            Repr::Os(..) => "os error",
+            Repr::Os(..) => match self.kind() {
+                ErrorKind::NotFound => "entity not found",
+                ErrorKind::PermissionDenied => "permission denied",
+                ErrorKind::ConnectionRefused => "connection refused",
+                ErrorKind::ConnectionReset => "connection reset",
+                ErrorKind::ConnectionAborted => "connection aborted",
+                ErrorKind::NotConnected => "not connected",
+                ErrorKind::AddrInUse => "address in use",
+                ErrorKind::AddrNotAvailable => "address not available",
+                ErrorKind::BrokenPipe => "broken pipe",
+                ErrorKind::AlreadyExists => "entity already exists",
+                ErrorKind::WouldBlock => "operation would block",
+                ErrorKind::InvalidInput => "invalid input parameter",
+                ErrorKind::InvalidData => "invalid data",
+                ErrorKind::TimedOut => "timed out",
+                ErrorKind::WriteZero => "write zero",
+                ErrorKind::Interrupted => "operation interrupted",
+                ErrorKind::Other => "other os error",
+                ErrorKind::UnexpectedEof => "unexpected end of file",
+                ErrorKind::__Nonexhaustive => unreachable!()
+            },
             Repr::Custom(ref c) => c.error.description(),
         }
     }
@@ -316,7 +525,6 @@ mod test {
     use prelude::v1::*;
     use super::{Error, ErrorKind};
     use error;
-    use error::Error as error_Error;
     use fmt;
     use sys::os::error_string;
 
@@ -335,7 +543,7 @@ mod test {
         struct TestError;
 
         impl fmt::Display for TestError {
-            fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+            fn fmt(&self, _: &mut fmt::Formatter) -> fmt::Result {
                 Ok(())
             }
         }
@@ -349,10 +557,10 @@ mod test {
         // we have to call all of these UFCS style right now since method
         // resolution won't implicitly drop the Send+Sync bounds
         let mut err = Error::new(ErrorKind::Other, TestError);
-        assert!(error::Error::is::<TestError>(err.get_ref().unwrap()));
+        assert!(err.get_ref().unwrap().is::<TestError>());
         assert_eq!("asdf", err.get_ref().unwrap().description());
-        assert!(error::Error::is::<TestError>(err.get_mut().unwrap()));
+        assert!(err.get_mut().unwrap().is::<TestError>());
         let extracted = err.into_inner().unwrap();
-        error::Error::downcast::<TestError>(extracted).unwrap();
+        extracted.downcast::<TestError>().unwrap();
     }
 }

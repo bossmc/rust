@@ -25,14 +25,11 @@
 // unix (it's mostly used on windows), so don't worry about dead code here.
 #![allow(dead_code)]
 
-use core::prelude::*;
-
-use core::char::{encode_utf8_raw, encode_utf16_raw};
 use core::str::next_code_point;
 
 use ascii::*;
 use borrow::Cow;
-use cmp;
+use char;
 use fmt;
 use hash::{Hash, Hasher};
 use iter::FromIterator;
@@ -42,7 +39,6 @@ use slice;
 use str;
 use string::String;
 use sys_common::AsInner;
-use rustc_unicode::str::{Utf16Item, utf16_items};
 use vec::Vec;
 
 const UTF8_REPLACEMENT_CHARACTER: &'static [u8] = b"\xEF\xBF\xBD";
@@ -107,7 +103,7 @@ impl CodePoint {
     pub fn to_char(&self) -> Option<char> {
         match self.value {
             0xD800 ... 0xDFFF => None,
-            _ => Some(unsafe { mem::transmute(self.value) })
+            _ => Some(unsafe { char::from_u32_unchecked(self.value) })
         }
     }
 
@@ -149,13 +145,13 @@ impl fmt::Debug for Wtf8Buf {
 }
 
 impl Wtf8Buf {
-    /// Creates an new, empty WTF-8 string.
+    /// Creates a new, empty WTF-8 string.
     #[inline]
     pub fn new() -> Wtf8Buf {
         Wtf8Buf { bytes: Vec::new() }
     }
 
-    /// Creates an new, empty WTF-8 string with pre-allocated capacity for `n` bytes.
+    /// Creates a new, empty WTF-8 string with pre-allocated capacity for `n` bytes.
     #[inline]
     pub fn with_capacity(n: usize) -> Wtf8Buf {
         Wtf8Buf { bytes: Vec::with_capacity(n) }
@@ -181,20 +177,27 @@ impl Wtf8Buf {
         Wtf8Buf { bytes: <[_]>::to_vec(str.as_bytes()) }
     }
 
+    pub fn clear(&mut self) {
+        self.bytes.clear()
+    }
+
     /// Creates a WTF-8 string from a potentially ill-formed UTF-16 slice of 16-bit code units.
     ///
     /// This is lossless: calling `.encode_wide()` on the resulting string
     /// will always return the original code units.
     pub fn from_wide(v: &[u16]) -> Wtf8Buf {
         let mut string = Wtf8Buf::with_capacity(v.len());
-        for item in utf16_items(v) {
+        for item in char::decode_utf16(v.iter().cloned()) {
             match item {
-                Utf16Item::ScalarValue(c) => string.push_char(c),
-                Utf16Item::LoneSurrogate(s) => {
+                Ok(ch) => string.push_char(ch),
+                Err(surrogate) => {
+                    let surrogate = surrogate.unpaired_surrogate();
                     // Surrogates are known to be in the code point range.
-                    let code_point = unsafe { CodePoint::from_u32_unchecked(s as u32) };
+                    let code_point = unsafe {
+                        CodePoint::from_u32_unchecked(surrogate as u32)
+                    };
                     // Skip the WTF-8 concatenation check,
-                    // surrogate pairs are already decoded by utf16_items
+                    // surrogate pairs are already decoded by decode_utf16
                     string.push_code_point_unchecked(code_point)
                 }
             }
@@ -205,26 +208,15 @@ impl Wtf8Buf {
     /// Copied from String::push
     /// This does **not** include the WTF-8 concatenation check.
     fn push_code_point_unchecked(&mut self, code_point: CodePoint) {
-        let cur_len = self.len();
-        // This may use up to 4 bytes.
-        self.reserve(4);
-
-        unsafe {
-            // Attempt to not use an intermediate buffer by just pushing bytes
-            // directly onto this string.
-            let slice = slice::from_raw_parts_mut(
-                self.bytes.as_mut_ptr().offset(cur_len as isize),
-                4
-            );
-            let used = encode_utf8_raw(code_point.value, mem::transmute(slice))
-                .unwrap_or(0);
-            self.bytes.set_len(cur_len + used);
-        }
+        let bytes = unsafe {
+            char::from_u32_unchecked(code_point.value).encode_utf8()
+        };
+        self.bytes.extend_from_slice(bytes.as_slice());
     }
 
     #[inline]
     pub fn as_slice(&self) -> &Wtf8 {
-        unsafe { mem::transmute(&*self.bytes) }
+        unsafe { Wtf8::from_bytes_unchecked(&self.bytes) }
     }
 
     /// Reserves capacity for at least `additional` more bytes to be inserted
@@ -239,6 +231,11 @@ impl Wtf8Buf {
         self.bytes.reserve(additional)
     }
 
+    #[inline]
+    pub fn reserve_exact(&mut self, additional: usize) {
+        self.bytes.reserve_exact(additional)
+    }
+
     /// Returns the number of bytes that this string buffer can hold without reallocating.
     #[inline]
     pub fn capacity(&self) -> usize {
@@ -248,7 +245,7 @@ impl Wtf8Buf {
     /// Append a UTF-8 slice at the end of the string.
     #[inline]
     pub fn push_str(&mut self, other: &str) {
-        self.bytes.push_all(other.as_bytes())
+        self.bytes.extend_from_slice(other.as_bytes())
     }
 
     /// Append a WTF-8 slice at the end of the string.
@@ -267,9 +264,9 @@ impl Wtf8Buf {
                 // 4 bytes for the supplementary code point
                 self.bytes.reserve(4 + other_without_trail_surrogate.len());
                 self.push_char(decode_surrogate_pair(lead, trail));
-                self.bytes.push_all(other_without_trail_surrogate);
+                self.bytes.extend_from_slice(other_without_trail_surrogate);
             }
-            _ => self.bytes.push_all(&other.bytes)
+            _ => self.bytes.extend_from_slice(&other.bytes)
         }
     }
 
@@ -286,19 +283,13 @@ impl Wtf8Buf {
     /// like concatenating ill-formed UTF-16 strings effectively would.
     #[inline]
     pub fn push(&mut self, code_point: CodePoint) {
-        match code_point.to_u32() {
-            trail @ 0xDC00...0xDFFF => {
-                match (&*self).final_lead_surrogate() {
-                    Some(lead) => {
-                        let len_without_lead_surrogate = self.len() - 3;
-                        self.bytes.truncate(len_without_lead_surrogate);
-                        self.push_char(decode_surrogate_pair(lead, trail as u16));
-                        return
-                    }
-                    _ => {}
-                }
+        if let trail @ 0xDC00...0xDFFF = code_point.to_u32() {
+            if let Some(lead) = (&*self).final_lead_surrogate() {
+                let len_without_lead_surrogate = self.len() - 3;
+                self.bytes.truncate(len_without_lead_surrogate);
+                self.push_char(decode_surrogate_pair(lead, trail as u16));
+                return
             }
-            _ => {}
         }
 
         // No newly paired surrogates at the boundary.
@@ -342,10 +333,8 @@ impl Wtf8Buf {
             match self.next_surrogate(pos) {
                 Some((surrogate_pos, _)) => {
                     pos = surrogate_pos + 3;
-                    slice::bytes::copy_memory(
-                        UTF8_REPLACEMENT_CHARACTER,
-                        &mut self.bytes[surrogate_pos .. pos],
-                    );
+                    self.bytes[surrogate_pos..pos]
+                        .copy_from_slice(UTF8_REPLACEMENT_CHARACTER);
                 },
                 None => return unsafe { String::from_utf8_unchecked(self.bytes) }
             }
@@ -370,8 +359,8 @@ impl FromIterator<CodePoint> for Wtf8Buf {
 /// This replaces surrogate code point pairs with supplementary code points,
 /// like concatenating ill-formed UTF-16 strings effectively would.
 impl Extend<CodePoint> for Wtf8Buf {
-    fn extend<T: IntoIterator<Item=CodePoint>>(&mut self, iterable: T) {
-        let iterator = iterable.into_iter();
+    fn extend<T: IntoIterator<Item=CodePoint>>(&mut self, iter: T) {
+        let iterator = iter.into_iter();
         let (low, _high) = iterator.size_hint();
         // Lower bound of one byte per code point (ASCII only)
         self.bytes.reserve(low);
@@ -385,6 +374,7 @@ impl Extend<CodePoint> for Wtf8Buf {
 ///
 /// Similar to `&str`, but can additionally contain surrogate code points
 /// if they’re not in a surrogate pair.
+#[derive(Eq, Ord, PartialEq, PartialOrd)]
 pub struct Wtf8 {
     bytes: [u8]
 }
@@ -393,60 +383,40 @@ impl AsInner<[u8]> for Wtf8 {
     fn as_inner(&self) -> &[u8] { &self.bytes }
 }
 
-// FIXME: https://github.com/rust-lang/rust/issues/18805
-impl PartialEq for Wtf8 {
-    fn eq(&self, other: &Wtf8) -> bool { self.bytes.eq(&other.bytes) }
-}
-
-// FIXME: https://github.com/rust-lang/rust/issues/18805
-impl Eq for Wtf8 {}
-
-// FIXME: https://github.com/rust-lang/rust/issues/18738
-impl PartialOrd for Wtf8 {
-    #[inline]
-    fn partial_cmp(&self, other: &Wtf8) -> Option<cmp::Ordering> {
-        self.bytes.partial_cmp(&other.bytes)
-    }
-    #[inline]
-    fn lt(&self, other: &Wtf8) -> bool { self.bytes.lt(&other.bytes) }
-    #[inline]
-    fn le(&self, other: &Wtf8) -> bool { self.bytes.le(&other.bytes) }
-    #[inline]
-    fn gt(&self, other: &Wtf8) -> bool { self.bytes.gt(&other.bytes) }
-    #[inline]
-    fn ge(&self, other: &Wtf8) -> bool { self.bytes.ge(&other.bytes) }
-}
-
-// FIXME: https://github.com/rust-lang/rust/issues/18738
-impl Ord for Wtf8 {
-    #[inline]
-    fn cmp(&self, other: &Wtf8) -> cmp::Ordering { self.bytes.cmp(&other.bytes) }
-}
-
 /// Format the slice with double quotes,
 /// and surrogates as `\u` followed by four hexadecimal digits.
 /// Example: `"a\u{D800}"` for a slice with code points [U+0061, U+D800]
 impl fmt::Debug for Wtf8 {
-    fn fmt(&self, formatter: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-        try!(formatter.write_str("\""));
+    fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        fn write_str_escaped(f: &mut fmt::Formatter, s: &str) -> fmt::Result {
+            use fmt::Write;
+            for c in s.chars().flat_map(|c| c.escape_debug()) {
+                f.write_char(c)?
+            }
+            Ok(())
+        }
+
+        formatter.write_str("\"")?;
         let mut pos = 0;
         loop {
             match self.next_surrogate(pos) {
                 None => break,
                 Some((surrogate_pos, surrogate)) => {
-                    try!(formatter.write_str(unsafe {
-                        // the data in this slice is valid UTF-8, transmute to &str
-                        mem::transmute(&self.bytes[pos .. surrogate_pos])
-                    }));
-                    try!(write!(formatter, "\\u{{{:X}}}", surrogate));
+                    write_str_escaped(
+                        formatter,
+                        unsafe { str::from_utf8_unchecked(
+                            &self.bytes[pos .. surrogate_pos]
+                        )},
+                    )?;
+                    write!(formatter, "\\u{{{:x}}}", surrogate)?;
                     pos = surrogate_pos + 3;
                 }
             }
         }
-        try!(formatter.write_str(unsafe {
-            // the data in this slice is valid UTF-8, transmute to &str
-            mem::transmute(&self.bytes[pos..])
-        }));
+        write_str_escaped(
+            formatter,
+            unsafe { str::from_utf8_unchecked(&self.bytes[pos..]) },
+        )?;
         formatter.write_str("\"")
     }
 }
@@ -457,13 +427,27 @@ impl Wtf8 {
     /// Since WTF-8 is a superset of UTF-8, this always succeeds.
     #[inline]
     pub fn from_str(value: &str) -> &Wtf8 {
-        unsafe { mem::transmute(value.as_bytes()) }
+        unsafe { Wtf8::from_bytes_unchecked(value.as_bytes()) }
+    }
+
+    /// Creates a WTF-8 slice from a WTF-8 byte slice.
+    ///
+    /// Since the byte slice is not checked for valid WTF-8, this functions is
+    /// marked unsafe.
+    #[inline]
+    unsafe fn from_bytes_unchecked(value: &[u8]) -> &Wtf8 {
+        mem::transmute(value)
     }
 
     /// Returns the length, in WTF-8 bytes.
     #[inline]
     pub fn len(&self) -> usize {
         self.bytes.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
     }
 
     /// Returns the code point at `position` if it is in the ASCII range,
@@ -514,18 +498,18 @@ impl Wtf8 {
         };
         let wtf8_bytes = &self.bytes;
         let mut utf8_bytes = Vec::with_capacity(self.len());
-        utf8_bytes.push_all(&wtf8_bytes[..surrogate_pos]);
-        utf8_bytes.push_all(UTF8_REPLACEMENT_CHARACTER);
+        utf8_bytes.extend_from_slice(&wtf8_bytes[..surrogate_pos]);
+        utf8_bytes.extend_from_slice(UTF8_REPLACEMENT_CHARACTER);
         let mut pos = surrogate_pos + 3;
         loop {
             match self.next_surrogate(pos) {
                 Some((surrogate_pos, _)) => {
-                    utf8_bytes.push_all(&wtf8_bytes[pos .. surrogate_pos]);
-                    utf8_bytes.push_all(UTF8_REPLACEMENT_CHARACTER);
+                    utf8_bytes.extend_from_slice(&wtf8_bytes[pos .. surrogate_pos]);
+                    utf8_bytes.extend_from_slice(UTF8_REPLACEMENT_CHARACTER);
                     pos = surrogate_pos + 3;
                 },
                 None => {
-                    utf8_bytes.push_all(&wtf8_bytes[pos..]);
+                    utf8_bytes.extend_from_slice(&wtf8_bytes[pos..]);
                     return Cow::Owned(unsafe { String::from_utf8_unchecked(utf8_bytes) })
                 }
             }
@@ -583,7 +567,7 @@ impl Wtf8 {
             return None
         }
         match &self.bytes[(len - 3)..] {
-            [0xED, b2 @ 0xA0...0xAF, b3] => Some(decode_surrogate(b2, b3)),
+            &[0xED, b2 @ 0xA0...0xAF, b3] => Some(decode_surrogate(b2, b3)),
             _ => None
         }
     }
@@ -595,7 +579,7 @@ impl Wtf8 {
             return None
         }
         match &self.bytes[..3] {
-            [0xED, b2 @ 0xB0...0xBF, b3] => Some(decode_surrogate(b2, b3)),
+            &[0xED, b2 @ 0xB0...0xBF, b3] => Some(decode_surrogate(b2, b3)),
             _ => None
         }
     }
@@ -682,7 +666,7 @@ fn decode_surrogate(second_byte: u8, third_byte: u8) -> u16 {
 #[inline]
 fn decode_surrogate_pair(lead: u16, trail: u16) -> char {
     let code_point = 0x10000 + ((((lead - 0xD800) as u32) << 10) | (trail - 0xDC00) as u32);
-    unsafe { mem::transmute(code_point) }
+    unsafe { char::from_u32_unchecked(code_point) }
 }
 
 /// Copied from core::str::StrPrelude::is_char_boundary
@@ -699,7 +683,7 @@ pub fn is_code_point_boundary(slice: &Wtf8, index: usize) -> bool {
 #[inline]
 pub unsafe fn slice_unchecked(s: &Wtf8, begin: usize, end: usize) -> &Wtf8 {
     // memory layout of an &[u8] and &Wtf8 are the same
-    mem::transmute(slice::from_raw_parts(
+    Wtf8::from_bytes_unchecked(slice::from_raw_parts(
         s.bytes.as_ptr().offset(begin as isize),
         end - begin
     ))
@@ -731,11 +715,12 @@ impl<'a> Iterator for Wtf8CodePoints<'a> {
 
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let (len, _) = self.bytes.size_hint();
+        let len = self.bytes.len();
         (len.saturating_add(3) / 4, Some(len))
     }
 }
 
+#[stable(feature = "rust1", since = "1.0.0")]
 #[derive(Clone)]
 pub struct EncodeWide<'a> {
     code_points: Wtf8CodePoints<'a>,
@@ -743,6 +728,7 @@ pub struct EncodeWide<'a> {
 }
 
 // Copied from libunicode/u_str.rs
+#[stable(feature = "rust1", since = "1.0.0")]
 impl<'a> Iterator for EncodeWide<'a> {
     type Item = u16;
 
@@ -754,12 +740,15 @@ impl<'a> Iterator for EncodeWide<'a> {
             return Some(tmp);
         }
 
-        let mut buf = [0; 2];
         self.code_points.next().map(|code_point| {
-            let n = encode_utf16_raw(code_point.value, &mut buf)
-                .unwrap_or(0);
-            if n == 2 { self.extra = buf[1]; }
-            buf[0]
+            let n = unsafe {
+                char::from_u32_unchecked(code_point.value).encode_utf16()
+            };
+            let n = n.as_slice();
+            if n.len() == 2 {
+                self.extra = n[1];
+            }
+            n[0]
         })
     }
 
@@ -821,7 +810,6 @@ mod tests {
     use prelude::v1::*;
     use borrow::Cow;
     use super::*;
-    use mem::transmute;
 
     #[test]
     fn code_point_from_u32() {
@@ -962,7 +950,7 @@ mod tests {
         string.push_wtf8(Wtf8::from_str(" 💩"));
         assert_eq!(string.bytes, b"a\xC3\xA9 \xF0\x9F\x92\xA9");
 
-        fn w(value: &[u8]) -> &Wtf8 { unsafe { transmute(value) } }
+        fn w(v: &[u8]) -> &Wtf8 { unsafe { Wtf8::from_bytes_unchecked(v) } }
 
         let mut string = Wtf8Buf::new();
         string.push_wtf8(w(b"\xED\xA0\xBD"));  // lead
@@ -1041,7 +1029,7 @@ mod tests {
     fn wtf8buf_from_iterator() {
         fn f(values: &[u32]) -> Wtf8Buf {
             values.iter().map(|&c| CodePoint::from_u32(c).unwrap()).collect::<Wtf8Buf>()
-        };
+        }
         assert_eq!(f(&[0x61, 0xE9, 0x20, 0x1F4A9]).bytes, b"a\xC3\xA9 \xF0\x9F\x92\xA9");
 
         assert_eq!(f(&[0xD83D, 0xDCA9]).bytes, b"\xF0\x9F\x92\xA9");  // Magic!
@@ -1060,7 +1048,7 @@ mod tests {
             let mut string = initial.iter().map(c).collect::<Wtf8Buf>();
             string.extend(extended.iter().map(c));
             string
-        };
+        }
 
         assert_eq!(e(&[0x61, 0xE9], &[0x20, 0x1F4A9]).bytes,
                    b"a\xC3\xA9 \xF0\x9F\x92\xA9");
@@ -1076,9 +1064,9 @@ mod tests {
 
     #[test]
     fn wtf8buf_show() {
-        let mut string = Wtf8Buf::from_str("aé 💩");
+        let mut string = Wtf8Buf::from_str("a\té \u{7f}💩\r");
         string.push(CodePoint::from_u32(0xD800).unwrap());
-        assert_eq!(format!("{:?}", string), r#""aé 💩\u{D800}""#);
+        assert_eq!(format!("{:?}", string), "\"a\\té \\u{7f}\u{1f4a9}\\r\\u{d800}\"");
     }
 
     #[test]
@@ -1087,10 +1075,10 @@ mod tests {
     }
 
     #[test]
-    fn wtf8_show() {
-        let mut string = Wtf8Buf::from_str("aé 💩");
-        string.push(CodePoint::from_u32(0xD800).unwrap());
-        assert_eq!(format!("{:?}", string), r#""aé 💩\u{D800}""#);
+    fn wtf8buf_show_str() {
+        let text = "a\té 💩\r";
+        let string = Wtf8Buf::from_str(text);
+        assert_eq!(format!("{:?}", text), format!("{:?}", string));
     }
 
     #[test]

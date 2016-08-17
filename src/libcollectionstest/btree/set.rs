@@ -9,7 +9,9 @@
 // except according to those terms.
 
 use std::collections::BTreeSet;
-use std::hash::{SipHasher, self};
+
+use std::iter::FromIterator;
+use super::DeterministicRng;
 
 #[test]
 fn test_clone_eq() {
@@ -34,7 +36,7 @@ fn test_hash() {
   y.insert(2);
   y.insert(1);
 
-  assert!(hash::hash::<_, SipHasher>(&x) == hash::hash::<_, SipHasher>(&y));
+  assert!(::hash(&x) == ::hash(&y));
 }
 
 struct Counter<'a, 'b> {
@@ -149,15 +151,9 @@ fn test_zip() {
     let y = y;
     let mut z = x.iter().zip(&y);
 
-    // FIXME: #5801: this needs a type hint to compile...
-    let result: Option<(&usize, & &'static str)> = z.next();
-    assert_eq!(result.unwrap(), (&5, &("bar")));
-
-    let result: Option<(&usize, & &'static str)> = z.next();
-    assert_eq!(result.unwrap(), (&11, &("foo")));
-
-    let result: Option<(&usize, & &'static str)> = z.next();
-    assert!(result.is_none());
+    assert_eq!(z.next().unwrap(), (&5, &("bar")));
+    assert_eq!(z.next().unwrap(), (&11, &("foo")));
+    assert!(z.next().is_none());
 }
 
 #[test]
@@ -211,4 +207,133 @@ fn test_extend_ref() {
     assert!(a.contains(&4));
     assert!(a.contains(&5));
     assert!(a.contains(&6));
+}
+
+#[test]
+fn test_recovery() {
+    use std::cmp::Ordering;
+
+    #[derive(Debug)]
+    struct Foo(&'static str, i32);
+
+    impl PartialEq for Foo {
+        fn eq(&self, other: &Self) -> bool {
+            self.0 == other.0
+        }
+    }
+
+    impl Eq for Foo {}
+
+    impl PartialOrd for Foo {
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+            self.0.partial_cmp(&other.0)
+        }
+    }
+
+    impl Ord for Foo {
+        fn cmp(&self, other: &Self) -> Ordering {
+            self.0.cmp(&other.0)
+        }
+    }
+
+    let mut s = BTreeSet::new();
+    assert_eq!(s.replace(Foo("a", 1)), None);
+    assert_eq!(s.len(), 1);
+    assert_eq!(s.replace(Foo("a", 2)), Some(Foo("a", 1)));
+    assert_eq!(s.len(), 1);
+
+    {
+        let mut it = s.iter();
+        assert_eq!(it.next(), Some(&Foo("a", 2)));
+        assert_eq!(it.next(), None);
+    }
+
+    assert_eq!(s.get(&Foo("a", 1)), Some(&Foo("a", 2)));
+    assert_eq!(s.take(&Foo("a", 1)), Some(Foo("a", 2)));
+    assert_eq!(s.len(), 0);
+
+    assert_eq!(s.get(&Foo("a", 1)), None);
+    assert_eq!(s.take(&Foo("a", 1)), None);
+
+    assert_eq!(s.iter().next(), None);
+}
+
+#[test]
+#[allow(dead_code)]
+fn test_variance() {
+    use std::collections::btree_set::{IntoIter, Iter, Range};
+
+    fn set<'new>(v: BTreeSet<&'static str>) -> BTreeSet<&'new str> { v }
+    fn iter<'a, 'new>(v: Iter<'a, &'static str>) -> Iter<'a, &'new str> { v }
+    fn into_iter<'new>(v: IntoIter<&'static str>) -> IntoIter<&'new str> { v }
+    fn range<'a, 'new>(v: Range<'a, &'static str>) -> Range<'a, &'new str> { v }
+}
+
+#[test]
+fn test_append() {
+    let mut a = BTreeSet::new();
+    a.insert(1);
+    a.insert(2);
+    a.insert(3);
+
+    let mut b = BTreeSet::new();
+    b.insert(3);
+    b.insert(4);
+    b.insert(5);
+
+    a.append(&mut b);
+
+    assert_eq!(a.len(), 5);
+    assert_eq!(b.len(), 0);
+
+    assert_eq!(a.contains(&1), true);
+    assert_eq!(a.contains(&2), true);
+    assert_eq!(a.contains(&3), true);
+    assert_eq!(a.contains(&4), true);
+    assert_eq!(a.contains(&5), true);
+}
+
+fn rand_data(len: usize) -> Vec<u32> {
+    let mut rng = DeterministicRng::new();
+    Vec::from_iter(
+        (0..len).map(|_| rng.next())
+    )
+}
+
+#[test]
+fn test_split_off_empty_right() {
+    let mut data = rand_data(173);
+
+    let mut set = BTreeSet::from_iter(data.clone());
+    let right = set.split_off(&(data.iter().max().unwrap() + 1));
+
+    data.sort();
+    assert!(set.into_iter().eq(data));
+    assert!(right.into_iter().eq(None));
+}
+
+#[test]
+fn test_split_off_empty_left() {
+    let mut data = rand_data(314);
+
+    let mut set = BTreeSet::from_iter(data.clone());
+    let right = set.split_off(data.iter().min().unwrap());
+
+    data.sort();
+    assert!(set.into_iter().eq(None));
+    assert!(right.into_iter().eq(data));
+}
+
+#[test]
+fn test_split_off_large_random_sorted() {
+    let mut data = rand_data(1529);
+    // special case with maximum height.
+    data.sort();
+
+    let mut set = BTreeSet::from_iter(data.clone());
+    let key = data[data.len() / 2];
+    let right = set.split_off(&key);
+
+    assert!(set.into_iter().eq(data.clone().into_iter().filter(|x| *x < key)));
+    assert!(right.into_iter().eq(data.into_iter().filter(|x| *x >= key)));
 }

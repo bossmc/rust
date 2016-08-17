@@ -10,10 +10,11 @@
 
 //! Decodes a floating-point value into individual parts and error ranges.
 
-use prelude::*;
+use prelude::v1::*;
 
 use {f32, f64};
-use num::{Float, FpCategory};
+use num::FpCategory;
+use num::dec2flt::rawfp::RawFloat;
 
 /// Decoded unsigned finite value, such that:
 ///
@@ -52,28 +53,23 @@ pub enum FullDecoded {
 }
 
 /// A floating point type which can be `decode`d.
-pub trait DecodableFloat: Float + Copy {
-    /// Returns `x * 2^exp`. Almost same to `std::{f32,f64}::ldexp`.
-    /// This is used for testing.
-    fn ldexpi(f: i64, exp: isize) -> Self;
+pub trait DecodableFloat: RawFloat + Copy {
     /// The minimum positive normalized value.
     fn min_pos_norm_value() -> Self;
 }
 
 impl DecodableFloat for f32 {
-    fn ldexpi(f: i64, exp: isize) -> Self { f as Self * (exp as Self).exp2() }
     fn min_pos_norm_value() -> Self { f32::MIN_POSITIVE }
 }
 
 impl DecodableFloat for f64 {
-    fn ldexpi(f: i64, exp: isize) -> Self { f as Self * (exp as Self).exp2() }
     fn min_pos_norm_value() -> Self { f64::MIN_POSITIVE }
 }
 
 /// Returns a sign (true when negative) and `FullDecoded` value
 /// from given floating point number.
 pub fn decode<T: DecodableFloat>(v: T) -> (/*negative?*/ bool, FullDecoded) {
-    let (mant, exp, sign) = v.integer_decode();
+    let (mant, exp, sign) = v.integer_decode2();
     let even = (mant & 1) == 0;
     let decoded = match v.classify() {
         FpCategory::Nan => FullDecoded::Nan,
@@ -87,7 +83,7 @@ pub fn decode<T: DecodableFloat>(v: T) -> (/*negative?*/ bool, FullDecoded) {
                                           exp: exp, inclusive: even })
         }
         FpCategory::Normal => {
-            let minnorm = <T as DecodableFloat>::min_pos_norm_value().integer_decode();
+            let minnorm = <T as DecodableFloat>::min_pos_norm_value().integer_decode2();
             if mant == minnorm.0 {
                 // neighbors: (maxmant, exp - 1) -- (minnormmant, exp) -- (minnormmant + 1, exp)
                 // where maxmant = minnormmant * 2 - 1

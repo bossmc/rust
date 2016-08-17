@@ -16,29 +16,34 @@ pub use self::Diagnostic::*;
 use libc::{c_char, c_uint};
 use std::ptr;
 
-use {ValueRef, TwineRef, DebugLocRef, DiagnosticInfoRef};
+use {DiagnosticInfoRef, TwineRef, ValueRef};
+use ffi::DebugLocRef;
 
 #[derive(Copy, Clone)]
 pub enum OptimizationDiagnosticKind {
     OptimizationRemark,
     OptimizationMissed,
     OptimizationAnalysis,
+    OptimizationAnalysisFPCommute,
+    OptimizationAnalysisAliasing,
     OptimizationFailure,
+    OptimizationRemarkOther,
 }
 
 impl OptimizationDiagnosticKind {
     pub fn describe(self) -> &'static str {
         match self {
-            OptimizationRemark => "remark",
+            OptimizationRemark |
+            OptimizationRemarkOther => "remark",
             OptimizationMissed => "missed",
             OptimizationAnalysis => "analysis",
+            OptimizationAnalysisFPCommute => "floating-point",
+            OptimizationAnalysisAliasing => "aliasing",
             OptimizationFailure => "failure",
         }
     }
 }
 
-#[allow(raw_pointer_derive)]
-#[derive(Copy, Clone)]
 pub struct OptimizationDiagnostic {
     pub kind: OptimizationDiagnosticKind,
     pub pass_name: *const c_char,
@@ -48,8 +53,9 @@ pub struct OptimizationDiagnostic {
 }
 
 impl OptimizationDiagnostic {
-    unsafe fn unpack(kind: OptimizationDiagnosticKind, di: DiagnosticInfoRef)
-            -> OptimizationDiagnostic {
+    unsafe fn unpack(kind: OptimizationDiagnosticKind,
+                     di: DiagnosticInfoRef)
+                     -> OptimizationDiagnostic {
 
         let mut opt = OptimizationDiagnostic {
             kind: kind,
@@ -59,11 +65,11 @@ impl OptimizationDiagnostic {
             message: ptr::null_mut(),
         };
 
-        super::LLVMUnpackOptimizationDiagnostic(di,
-            &mut opt.pass_name,
-            &mut opt.function,
-            &mut opt.debug_loc,
-            &mut opt.message);
+        super::LLVMRustUnpackOptimizationDiagnostic(di,
+                                                    &mut opt.pass_name,
+                                                    &mut opt.function,
+                                                    &mut opt.debug_loc,
+                                                    &mut opt.message);
 
         opt
     }
@@ -77,8 +83,7 @@ pub struct InlineAsmDiagnostic {
 }
 
 impl InlineAsmDiagnostic {
-    unsafe fn unpack(di: DiagnosticInfoRef)
-            -> InlineAsmDiagnostic {
+    unsafe fn unpack(di: DiagnosticInfoRef) -> InlineAsmDiagnostic {
 
         let mut opt = InlineAsmDiagnostic {
             cookie: 0,
@@ -86,16 +91,15 @@ impl InlineAsmDiagnostic {
             instruction: ptr::null_mut(),
         };
 
-        super::LLVMUnpackInlineAsmDiagnostic(di,
-            &mut opt.cookie,
-            &mut opt.message,
-            &mut opt.instruction);
+        super::LLVMRustUnpackInlineAsmDiagnostic(di,
+                                                 &mut opt.cookie,
+                                                 &mut opt.message,
+                                                 &mut opt.instruction);
 
         opt
     }
 }
 
-#[derive(Copy, Clone)]
 pub enum Diagnostic {
     Optimization(OptimizationDiagnostic),
     InlineAsm(InlineAsmDiagnostic),
@@ -106,25 +110,43 @@ pub enum Diagnostic {
 
 impl Diagnostic {
     pub unsafe fn unpack(di: DiagnosticInfoRef) -> Diagnostic {
-        let kind = super::LLVMGetDiagInfoKind(di);
+        use super::DiagnosticKind as Dk;
+        let kind = super::LLVMRustGetDiagInfoKind(di);
 
         match kind {
-            super::DK_InlineAsm
-                => InlineAsm(InlineAsmDiagnostic::unpack(di)),
+            Dk::InlineAsm => InlineAsm(InlineAsmDiagnostic::unpack(di)),
 
-            super::DK_OptimizationRemark
-                => Optimization(OptimizationDiagnostic::unpack(OptimizationRemark, di)),
+            Dk::OptimizationRemark => {
+                Optimization(OptimizationDiagnostic::unpack(OptimizationRemark, di))
+            }
+            Dk::OptimizationRemarkOther => {
+                Optimization(OptimizationDiagnostic::unpack(OptimizationRemarkOther, di))
+            }
+            Dk::OptimizationRemarkMissed => {
+                Optimization(OptimizationDiagnostic::unpack(OptimizationMissed, di))
+            }
 
-            super::DK_OptimizationRemarkMissed
-                => Optimization(OptimizationDiagnostic::unpack(OptimizationMissed, di)),
+            Dk::OptimizationRemarkAnalysis => {
+                Optimization(OptimizationDiagnostic::unpack(OptimizationAnalysis, di))
+            }
 
-            super::DK_OptimizationRemarkAnalysis
-                => Optimization(OptimizationDiagnostic::unpack(OptimizationAnalysis, di)),
 
-            super::DK_OptimizationFailure
-                => Optimization(OptimizationDiagnostic::unpack(OptimizationFailure, di)),
+            Dk::OptimizationRemarkAnalysisFPCommute => {
+                Optimization(OptimizationDiagnostic::unpack(
+                    OptimizationAnalysisFPCommute, di))
+            }
 
-            _ => UnknownDiagnostic(di)
+            Dk::OptimizationRemarkAnalysisAliasing => {
+                Optimization(OptimizationDiagnostic::unpack(
+                    OptimizationAnalysisAliasing, di))
+            }
+
+
+            Dk::OptimizationFailure => {
+                Optimization(OptimizationDiagnostic::unpack(OptimizationFailure, di))
+            }
+
+            _ => UnknownDiagnostic(di),
         }
     }
 }

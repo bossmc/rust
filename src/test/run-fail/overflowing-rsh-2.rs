@@ -8,12 +8,13 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-// error-pattern:thread '<main>' panicked at 'shift operation overflowed'
+// ignore-pretty : (#23623) problems when  ending with // comments
+
+// error-pattern:thread 'main' panicked at 'attempt to shift right with overflow'
 // compile-flags: -C debug-assertions
 
-// (Work around constant-evaluation)
-fn id<T>(x: T) -> T { x }
+#![warn(exceeding_bitshifts)]
 
 fn main() {
-    let _x = -1_i32 >> id(-1);
+    let _x = -1_i32 >> -1;
 }

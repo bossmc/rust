@@ -9,83 +9,84 @@
 // except according to those terms.
 
 //! The `Default` trait for types which may have meaningful default values.
-//!
-//! Sometimes, you want to fall back to some kind of default value, and
-//! don't particularly care what it is. This comes up often with `struct`s
-//! that define a set of options:
-//!
-//! ```
-//! struct SomeOptions {
-//!     foo: i32,
-//!     bar: f32,
-//! }
-//! ```
-//!
-//! How can we define some default values? You can use `Default`:
-//!
-//! ```
-//! #[derive(Default)]
-//! struct SomeOptions {
-//!     foo: i32,
-//!     bar: f32,
-//! }
-//!
-//!
-//! fn main() {
-//!     let options: SomeOptions = Default::default();
-//! }
-//! ```
-//!
-//! Now, you get all of the default values. Rust implements `Default` for various primitives types.
-//! If you have your own type, you need to implement `Default` yourself:
-//!
-//! ```
-//! enum Kind {
-//!     A,
-//!     B,
-//!     C,
-//! }
-//!
-//! impl Default for Kind {
-//!     fn default() -> Kind { Kind::A }
-//! }
-//!
-//! #[derive(Default)]
-//! struct SomeOptions {
-//!     foo: i32,
-//!     bar: f32,
-//!     baz: Kind,
-//! }
-//!
-//!
-//! fn main() {
-//!     let options: SomeOptions = Default::default();
-//! }
-//! ```
-//!
-//! If you want to override a particular option, but still retain the other defaults:
-//!
-//! ```
-//! # #[derive(Default)]
-//! # struct SomeOptions {
-//! #     foo: i32,
-//! #     bar: f32,
-//! # }
-//! fn main() {
-//!     let options = SomeOptions { foo: 42, ..Default::default() };
-//! }
-//! ```
 
 #![stable(feature = "rust1", since = "1.0.0")]
 
-/// A trait that types which have a useful default value should implement.
+use marker::Sized;
+
+/// A trait for giving a type a useful default value.
 ///
-/// A struct can derive default implementations of `Default` for basic types using
-/// `#[derive(Default)]`.
+/// Sometimes, you want to fall back to some kind of default value, and
+/// don't particularly care what it is. This comes up often with `struct`s
+/// that define a set of options:
+///
+/// ```
+/// # #[allow(dead_code)]
+/// struct SomeOptions {
+///     foo: i32,
+///     bar: f32,
+/// }
+/// ```
+///
+/// How can we define some default values? You can use `Default`:
+///
+/// ```
+/// # #[allow(dead_code)]
+/// #[derive(Default)]
+/// struct SomeOptions {
+///     foo: i32,
+///     bar: f32,
+/// }
+///
+///
+/// fn main() {
+///     let options: SomeOptions = Default::default();
+/// }
+/// ```
+///
+/// Now, you get all of the default values. Rust implements `Default` for various primitives types.
+///
+/// If you want to override a particular option, but still retain the other defaults:
+///
+/// ```
+/// # #[allow(dead_code)]
+/// # #[derive(Default)]
+/// # struct SomeOptions {
+/// #     foo: i32,
+/// #     bar: f32,
+/// # }
+/// fn main() {
+///     let options = SomeOptions { foo: 42, ..Default::default() };
+/// }
+/// ```
+///
+/// ## Derivable
+///
+/// This trait can be used with `#[derive]` if all of the type's fields implement
+/// `Default`. When `derive`d, it will use the default value for each field's type.
+///
+/// ## How can I implement `Default`?
+///
+/// Provide an implementation for the `default()` method that returns the value of
+/// your type that should be the default:
+///
+/// ```
+/// # #![allow(dead_code)]
+/// enum Kind {
+///     A,
+///     B,
+///     C,
+/// }
+///
+/// impl Default for Kind {
+///     fn default() -> Kind { Kind::A }
+/// }
+/// ```
 ///
 /// # Examples
 ///
 /// ```
+/// # #[allow(dead_code)]
 /// #[derive(Default)]
 /// struct SomeOptions {
 ///     foo: i32,
@@ -93,7 +94,7 @@
 /// }
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
-pub trait Default {
+pub trait Default: Sized {
     /// Returns the "default value" for a type.
     ///
     /// Default values are often some kind of initial value, identity value, or anything else that
@@ -112,6 +113,7 @@ pub trait Default {
     /// Making your own:
     ///
     /// ```
+    /// # #[allow(dead_code)]
     /// enum Kind {
     ///     A,
     ///     B,
@@ -131,7 +133,6 @@ macro_rules! default_impl {
         #[stable(feature = "rust1", since = "1.0.0")]
         impl Default for $t {
             #[inline]
-            #[stable(feature = "rust1", since = "1.0.0")]
             fn default() -> $t { $v }
         }
     }

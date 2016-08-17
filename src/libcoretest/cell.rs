@@ -159,19 +159,6 @@ fn ref_map_accessor() {
 }
 
 #[test]
-fn ref_filter_map_accessor() {
-    struct X(RefCell<Result<u32, ()>>);
-    impl X {
-        fn accessor(&self) -> Option<Ref<u32>> {
-            Ref::filter_map(self.0.borrow(), |r| r.as_ref().ok())
-        }
-    }
-    let x = X(RefCell::new(Ok(7)));
-    let d: Ref<u32> = x.accessor().unwrap();
-    assert_eq!(*d, 7);
-}
-
-#[test]
 fn ref_mut_map_accessor() {
     struct X(RefCell<(u32, char)>);
     impl X {
@@ -186,23 +173,6 @@ fn ref_mut_map_accessor() {
         *d += 1;
     }
     assert_eq!(*x.0.borrow(), (8, 'z'));
-}
-
-#[test]
-fn ref_mut_filter_map_accessor() {
-    struct X(RefCell<Result<u32, ()>>);
-    impl X {
-        fn accessor(&self) -> Option<RefMut<u32>> {
-            RefMut::filter_map(self.0.borrow_mut(), |r| r.as_mut().ok())
-        }
-    }
-    let x = X(RefCell::new(Ok(7)));
-    {
-        let mut d: RefMut<u32> = x.accessor().unwrap();
-        assert_eq!(*d, 7);
-        *d += 1;
-    }
-    assert_eq!(*x.0.borrow(), Ok(8));
 }
 
 #[test]
@@ -248,15 +218,34 @@ fn unsafe_cell_unsized() {
     assert_eq!(unsafe { &mut *cell.get() }, comp);
 }
 
-// FIXME(#25351) needs deeply nested coercions of DST structs.
-// #[test]
-// fn refcell_unsized() {
-//     let cell: &RefCell<[i32]> = &RefCell::new([1, 2, 3]);
-//     {
-//         let b = &mut *cell.borrow_mut();
-//         b[0] = 4;
-//         b[2] = 5;
-//     }
-//     let comp: &mut [i32] = &mut [4, 2, 5];
-//     assert_eq!(&*cell.borrow(), comp);
-// }
+#[test]
+fn refcell_unsized() {
+    let cell: &RefCell<[i32]> = &RefCell::new([1, 2, 3]);
+    {
+        let b = &mut *cell.borrow_mut();
+        b[0] = 4;
+        b[2] = 5;
+    }
+    let comp: &mut [i32] = &mut [4, 2, 5];
+    assert_eq!(&*cell.borrow(), comp);
+}
+
+#[test]
+fn refcell_ref_coercion() {
+    let cell: RefCell<[i32; 3]> = RefCell::new([1, 2, 3]);
+    {
+        let mut cellref: RefMut<[i32; 3]> = cell.borrow_mut();
+        cellref[0] = 4;
+        let mut coerced: RefMut<[i32]> = cellref;
+        coerced[2] = 5;
+    }
+    {
+        let comp: &mut [i32] = &mut [4, 2, 5];
+        let cellref: Ref<[i32; 3]> = cell.borrow();
+        assert_eq!(&*cellref, comp);
+        let coerced: Ref<[i32]> = cellref;
+        assert_eq!(&*coerced, comp);
+    }
+}
+
+

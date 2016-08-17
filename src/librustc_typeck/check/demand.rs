@@ -9,64 +9,56 @@
 // except according to those terms.
 
 
-use check::{coercion, FnCtxt};
-use middle::ty::{self, Ty};
-use middle::infer;
+use check::FnCtxt;
+use rustc::ty::Ty;
+use rustc::infer::{InferOk, TypeOrigin};
 
-use std::result::Result::{Err, Ok};
-use syntax::ast;
-use syntax::codemap::Span;
+use syntax_pos::Span;
+use rustc::hir;
 
-// Requires that the two types unify, and prints an error message if
-// they don't.
-pub fn suptype<'a, 'tcx>(fcx: &FnCtxt<'a, 'tcx>, sp: Span,
-                         ty_expected: Ty<'tcx>, ty_actual: Ty<'tcx>) {
-    suptype_with_fn(fcx, sp, false, ty_expected, ty_actual,
-        |sp, e, a, s| { fcx.report_mismatched_types(sp, e, a, s) })
-}
-
-/// As `suptype`, but call `handle_err` if unification for subtyping fails.
-pub fn suptype_with_fn<'a, 'tcx, F>(fcx: &FnCtxt<'a, 'tcx>,
-                                    sp: Span,
-                                    b_is_expected: bool,
-                                    ty_a: Ty<'tcx>,
-                                    ty_b: Ty<'tcx>,
-                                    handle_err: F) where
-    F: FnOnce(Span, Ty<'tcx>, Ty<'tcx>, &ty::TypeError<'tcx>),
-{
-    // n.b.: order of actual, expected is reversed
-    match infer::mk_subty(fcx.infcx(), b_is_expected, infer::Misc(sp),
-                          ty_b, ty_a) {
-      Ok(()) => { /* ok */ }
-      Err(ref err) => {
-          handle_err(sp, ty_a, ty_b, err);
-      }
+impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
+    // Requires that the two types unify, and prints an error message if
+    // they don't.
+    pub fn demand_suptype(&self, sp: Span, expected: Ty<'tcx>, actual: Ty<'tcx>) {
+        let origin = TypeOrigin::Misc(sp);
+        match self.sub_types(false, origin, actual, expected) {
+            Ok(InferOk { obligations, .. }) => {
+                // FIXME(#32730) propagate obligations
+                assert!(obligations.is_empty());
+            },
+            Err(e) => {
+                self.report_mismatched_types(origin, expected, actual, e);
+            }
+        }
     }
-}
 
-pub fn eqtype<'a, 'tcx>(fcx: &FnCtxt<'a, 'tcx>, sp: Span,
-                        expected: Ty<'tcx>, actual: Ty<'tcx>) {
-    match infer::mk_eqty(fcx.infcx(), false, infer::Misc(sp), actual, expected) {
-        Ok(()) => { /* ok */ }
-        Err(ref err) => { fcx.report_mismatched_types(sp, expected, actual, err); }
+    pub fn demand_eqtype(&self, sp: Span, expected: Ty<'tcx>, actual: Ty<'tcx>) {
+        self.demand_eqtype_with_origin(TypeOrigin::Misc(sp), expected, actual);
     }
-}
 
-// Checks that the type of `expr` can be coerced to `expected`.
-pub fn coerce<'a, 'tcx>(fcx: &FnCtxt<'a, 'tcx>,
-                        sp: Span,
-                        expected: Ty<'tcx>,
-                        expr: &ast::Expr) {
-    let expr_ty = fcx.expr_ty(expr);
-    debug!("demand::coerce(expected = {:?}, expr_ty = {:?})",
-           expected,
-           expr_ty);
-    let expr_ty = fcx.resolve_type_vars_if_possible(expr_ty);
-    let expected = fcx.resolve_type_vars_if_possible(expected);
-    match coercion::mk_assignty(fcx, expr, expr_ty, expected) {
-      Ok(()) => { /* ok */ }
-      Err(ref err) => {
-        fcx.report_mismatched_types(sp, expected, expr_ty, err);
-      }
+    pub fn demand_eqtype_with_origin(&self,
+                                     origin: TypeOrigin,
+                                     expected: Ty<'tcx>,
+                                     actual: Ty<'tcx>)
+    {
+        match self.eq_types(false, origin, actual, expected) {
+            Ok(InferOk { obligations, .. }) => {
+                // FIXME(#32730) propagate obligations
+                assert!(obligations.is_empty());
+            },
+            Err(e) => {
+                self.report_mismatched_types(origin, expected, actual, e);
+            }
+        }
+    }
+
+    // Checks that the type of `expr` can be coerced to `expected`.
+    pub fn demand_coerce(&self, expr: &hir::Expr, expected: Ty<'tcx>) {
+        let expected = self.resolve_type_vars_with_obligations(expected);
+        if let Err(e) = self.try_coerce(expr, expected) {
+            let origin = TypeOrigin::Misc(expr.span);
+            let expr_ty = self.resolve_type_vars_with_obligations(self.expr_ty(expr));
+            self.report_mismatched_types(origin, expected, expr_ty, e);
+        }
     }
 }

@@ -37,7 +37,9 @@ impl<'al,'adds_bnd>     Drop for L<'al,'adds_bnd> where 'adds_bnd:'al {    // RE
 impl<'ml>               Drop for M<'ml>         { fn drop(&mut self) { } } // ACCEPT
 
 impl                    Drop for N<'static>     { fn drop(&mut self) { } } // REJECT
-//~^ ERROR Implementations of Drop cannot be specialized
+//~^ ERROR mismatched types
+//~| expected type `N<'n>`
+//~|    found type `N<'static>`
 
 impl<Cok_nobound> Drop for O<Cok_nobound> { fn drop(&mut self) { } } // ACCEPT
 
@@ -45,7 +47,7 @@ impl              Drop for P<i8>          { fn drop(&mut self) { } } // REJECT
 //~^ ERROR Implementations of Drop cannot be specialized
 
 impl<Adds_bnd:Bound> Drop for Q<Adds_bnd> { fn drop(&mut self) { } } // REJECT
-//~^ ERROR The requirement `Adds_bnd : Bound` is added only by the Drop impl.
+//~^ ERROR The requirement `Adds_bnd: Bound` is added only by the Drop impl.
 
 impl<'rbnd,Adds_rbnd:'rbnd> Drop for R<Adds_rbnd> { fn drop(&mut self) { } } // REJECT
 //~^ ERROR The requirement `Adds_rbnd : 'rbnd` is added only by the Drop impl.
@@ -57,9 +59,9 @@ impl<'t,Bt:'t>    Drop for T<'t,Bt>       { fn drop(&mut self) { } } // ACCEPT
 impl              Drop for U              { fn drop(&mut self) { } } // ACCEPT
 
 impl<One>         Drop for V<One,One>     { fn drop(&mut self) { } } // REJECT
-//~^ERROR Implementations of Drop cannot be specialized
+//~^ ERROR Implementations of Drop cannot be specialized
 
 impl<'lw>         Drop for W<'lw,'lw>     { fn drop(&mut self) { } } // REJECT
-//~^ERROR Implementations of Drop cannot be specialized
+//~^ ERROR cannot infer an appropriate lifetime
 
 pub fn main() { }

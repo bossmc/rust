@@ -23,8 +23,6 @@ use ffi::{OsStr, OsString};
 use fmt;
 use io;
 use path::{Path, PathBuf};
-use sync::atomic::{AtomicIsize, Ordering};
-use sync::StaticMutex;
 use sys::os as os_imp;
 
 /// Returns the current working directory as a `PathBuf`.
@@ -68,8 +66,6 @@ pub fn current_dir() -> io::Result<PathBuf> {
 pub fn set_current_dir<P: AsRef<Path>>(p: P) -> io::Result<()> {
     os_imp::chdir(p.as_ref())
 }
-
-static ENV_LOCK: StaticMutex = StaticMutex::new();
 
 /// An iterator over a snapshot of the environment variables of this process.
 ///
@@ -134,7 +130,6 @@ pub fn vars() -> Vars {
 /// ```
 #[stable(feature = "env", since = "1.0.0")]
 pub fn vars_os() -> VarsOs {
-    let _g = ENV_LOCK.lock();
     VarsOs { inner: os_imp::env() }
 }
 
@@ -175,6 +170,10 @@ impl Iterator for VarsOs {
 /// ```
 #[stable(feature = "env", since = "1.0.0")]
 pub fn var<K: AsRef<OsStr>>(key: K) -> Result<String, VarError> {
+    _var(key.as_ref())
+}
+
+fn _var(key: &OsStr) -> Result<String, VarError> {
     match var_os(key) {
         Some(s) => s.into_string().map_err(VarError::NotUnicode),
         None => Err(VarError::NotPresent)
@@ -182,7 +181,7 @@ pub fn var<K: AsRef<OsStr>>(key: K) -> Result<String, VarError> {
 }
 
 /// Fetches the environment variable `key` from the current process, returning
-/// None if the variable isn't set.
+/// `None` if the variable isn't set.
 ///
 /// # Examples
 ///
@@ -197,8 +196,13 @@ pub fn var<K: AsRef<OsStr>>(key: K) -> Result<String, VarError> {
 /// ```
 #[stable(feature = "env", since = "1.0.0")]
 pub fn var_os<K: AsRef<OsStr>>(key: K) -> Option<OsString> {
-    let _g = ENV_LOCK.lock();
-    os_imp::getenv(key.as_ref())
+    _var_os(key.as_ref())
+}
+
+fn _var_os(key: &OsStr) -> Option<OsString> {
+    os_imp::getenv(key).unwrap_or_else(|e| {
+        panic!("failed to get environment variable `{:?}`: {}", key, e)
+    })
 }
 
 /// Possible errors from the `env::var` method.
@@ -214,7 +218,7 @@ pub enum VarError {
     /// valid unicode data. The found data is returned as a payload of this
     /// variant.
     #[stable(feature = "env", since = "1.0.0")]
-    NotUnicode(OsString),
+    NotUnicode(#[stable(feature = "env", since = "1.0.0")] OsString),
 }
 
 #[stable(feature = "env", since = "1.0.0")]
@@ -253,6 +257,12 @@ impl Error for VarError {
 ///  - [Austin Group Bugzilla](http://austingroupbugs.net/view.php?id=188)
 ///  - [GNU C library Bugzilla](https://sourceware.org/bugzilla/show_bug.cgi?id=15607#c2)
 ///
+/// # Panics
+///
+/// This function may panic if `key` is empty, contains an ASCII equals sign
+/// `'='` or the NUL character `'\0'`, or when the value contains the NUL
+/// character.
+///
 /// # Examples
 ///
 /// ```
@@ -264,8 +274,14 @@ impl Error for VarError {
 /// ```
 #[stable(feature = "env", since = "1.0.0")]
 pub fn set_var<K: AsRef<OsStr>, V: AsRef<OsStr>>(k: K, v: V) {
-    let _g = ENV_LOCK.lock();
-    os_imp::setenv(k.as_ref(), v.as_ref())
+    _set_var(k.as_ref(), v.as_ref())
+}
+
+fn _set_var(k: &OsStr, v: &OsStr) {
+    os_imp::setenv(k, v).unwrap_or_else(|e| {
+        panic!("failed to set environment variable `{:?}` to `{:?}`: {}",
+               k, v, e)
+    })
 }
 
 /// Removes an environment variable from the environment of the currently running process.
@@ -281,6 +297,12 @@ pub fn set_var<K: AsRef<OsStr>, V: AsRef<OsStr>>(k: K, v: V) {
 ///  - [Austin Group Bugzilla](http://austingroupbugs.net/view.php?id=188)
 ///  - [GNU C library Bugzilla](https://sourceware.org/bugzilla/show_bug.cgi?id=15607#c2)
 ///
+/// # Panics
+///
+/// This function may panic if `key` is empty, contains an ASCII equals sign
+/// `'='` or the NUL character `'\0'`, or when the value contains the NUL
+/// character.
+///
 /// # Examples
 ///
 /// ```
@@ -295,11 +317,16 @@ pub fn set_var<K: AsRef<OsStr>, V: AsRef<OsStr>>(k: K, v: V) {
 /// ```
 #[stable(feature = "env", since = "1.0.0")]
 pub fn remove_var<K: AsRef<OsStr>>(k: K) {
-    let _g = ENV_LOCK.lock();
-    os_imp::unsetenv(k.as_ref())
+    _remove_var(k.as_ref())
 }
 
-/// An iterator over `Path` instances for parsing an environment variable
+fn _remove_var(k: &OsStr) {
+    os_imp::unsetenv(k).unwrap_or_else(|e| {
+        panic!("failed to remove environment variable `{:?}`: {}", k, e)
+    })
+}
+
+/// An iterator over `PathBuf` instances for parsing an environment variable
 /// according to platform-specific conventions.
 ///
 /// This structure is returned from `std::env::split_paths`.
@@ -389,19 +416,24 @@ impl Error for JoinPathsError {
     fn description(&self) -> &str { self.inner.description() }
 }
 
-/// Optionally returns the path to the current user's home directory if known.
+/// Returns the path of the current user's home directory if known.
 ///
 /// # Unix
 ///
 /// Returns the value of the 'HOME' environment variable if it is set
-/// and not equal to the empty string.
+/// and not equal to the empty string. Otherwise, it tries to determine the
+/// home directory by invoking the `getpwuid_r` function on the UID of the
+/// current user.
 ///
 /// # Windows
 ///
 /// Returns the value of the 'HOME' environment variable if it is
 /// set and not equal to the empty string. Otherwise, returns the value of the
 /// 'USERPROFILE' environment variable if it is set and not equal to the empty
-/// string.
+/// string. If both do not exist, [`GetUserProfileDirectory`][msdn] is used to
+/// return the appropriate path.
+///
+/// [msdn]: https://msdn.microsoft.com/en-us/library/windows/desktop/bb762280(v=vs.85).aspx
 ///
 /// # Examples
 ///
@@ -409,8 +441,8 @@ impl Error for JoinPathsError {
 /// use std::env;
 ///
 /// match env::home_dir() {
-///     Some(ref p) => println!("{}", p.display()),
-///     None => println!("Impossible to get your home dir!")
+///     Some(path) => println!("{}", path.display()),
+///     None => println!("Impossible to get your home dir!"),
 /// }
 /// ```
 #[stable(feature = "env", since = "1.0.0")]
@@ -418,16 +450,20 @@ pub fn home_dir() -> Option<PathBuf> {
     os_imp::home_dir()
 }
 
-/// Returns the path to a temporary directory.
+/// Returns the path of a temporary directory.
 ///
-/// On Unix, returns the value of the 'TMPDIR' environment variable if it is
-/// set, otherwise for non-Android it returns '/tmp'. If Android, since there
-/// is no global temporary folder (it is usually allocated per-app), we return
-/// '/data/local/tmp'.
+/// On Unix, returns the value of the `TMPDIR` environment variable if it is
+/// set, otherwise for non-Android it returns `/tmp`. If Android, since there
+/// is no global temporary folder (it is usually allocated per-app), it returns
+/// `/data/local/tmp`.
 ///
-/// On Windows, returns the value of, in order, the 'TMP', 'TEMP',
-/// 'USERPROFILE' environment variable  if any are set and not the empty
-/// string. Otherwise, tmpdir returns the path to the Windows directory.
+/// On Windows, returns the value of, in order, the `TMP`, `TEMP`,
+/// `USERPROFILE` environment variable if any are set and not the empty
+/// string. Otherwise, `temp_dir` returns the path of the Windows directory.
+/// This behavior is identical to that of [`GetTempPath`][msdn], which this
+/// function uses internally.
+///
+/// [msdn]: https://msdn.microsoft.com/en-us/library/windows/desktop/aa364992(v=vs.85).aspx
 ///
 /// ```
 /// use std::env;
@@ -446,17 +482,54 @@ pub fn temp_dir() -> PathBuf {
     os_imp::temp_dir()
 }
 
-/// Optionally returns the filesystem path to the current executable which is
-/// running but with the executable name.
+/// Returns the full filesystem path of the current running executable.
 ///
-/// The path returned is not necessarily a "real path" to the executable as
+/// The path returned is not necessarily a "real path" of the executable as
 /// there may be intermediate symlinks.
 ///
 /// # Errors
 ///
-/// Acquiring the path to the current executable is a platform-specific operation
+/// Acquiring the path of the current executable is a platform-specific operation
 /// that can fail for a good number of reasons. Some errors can include, but not
-/// be limited to filesystem operations failing or general syscall failures.
+/// be limited to, filesystem operations failing or general syscall failures.
+///
+/// # Security
+///
+/// The output of this function should not be used in anything that might have
+/// security implications. For example:
+///
+/// ```
+/// fn main() {
+///     println!("{:?}", std::env::current_exe());
+/// }
+/// ```
+///
+/// On Linux systems, if this is compiled as `foo`:
+///
+/// ```bash
+/// $ rustc foo.rs
+/// $ ./foo
+/// Ok("/home/alex/foo")
+/// ```
+///
+/// And you make a symbolic link of the program:
+///
+/// ```bash
+/// $ ln foo bar
+/// ```
+///
+/// When you run it, you won't get the original executable, you'll get the
+/// symlink:
+///
+/// ```bash
+/// $ ./bar
+/// Ok("/home/alex/bar")
+/// ```
+///
+/// This sort of behavior has been known to [lead to privilege escalation] when
+/// used incorrectly, for example.
+///
+/// [lead to privilege escalation]: http://securityvulns.com/Wdocument183.html
 ///
 /// # Examples
 ///
@@ -472,30 +545,6 @@ pub fn temp_dir() -> PathBuf {
 #[stable(feature = "env", since = "1.0.0")]
 pub fn current_exe() -> io::Result<PathBuf> {
     os_imp::current_exe()
-}
-
-static EXIT_STATUS: AtomicIsize = AtomicIsize::new(0);
-
-/// Sets the process exit code
-///
-/// Sets the exit code returned by the process if all supervised threads
-/// terminate successfully (without panicking). If the current root thread panics
-/// and is supervised by the scheduler then any user-specified exit status is
-/// ignored and the process exits with the default panic status.
-///
-/// Note that this is not synchronized against modifications of other threads.
-#[unstable(feature = "exit_status", reason = "managing the exit status may change")]
-#[deprecated(since = "1.2.0", reason = "use process::exit instead")]
-pub fn set_exit_status(code: i32) {
-    EXIT_STATUS.store(code as isize, Ordering::SeqCst)
-}
-
-/// Fetches the process's current exit code. This defaults to 0 and can change
-/// by calling `set_exit_status`.
-#[unstable(feature = "exit_status", reason = "managing the exit status may change")]
-#[deprecated(since = "1.2.0", reason = "use process::exit instead")]
-pub fn get_exit_status() -> i32 {
-    EXIT_STATUS.load(Ordering::SeqCst) as i32
 }
 
 /// An iterator over the arguments of a process, yielding a `String` value
@@ -515,14 +564,14 @@ pub struct ArgsOs { inner: os_imp::Args }
 /// Returns the arguments which this program was started with (normally passed
 /// via the command line).
 ///
-/// The first element is traditionally the path to the executable, but it can be
-/// set to arbitrary text, and it may not even exist, so this property should
+/// The first element is traditionally the path of the executable, but it can be
+/// set to arbitrary text, and may not even exist. This means this property should
 /// not be relied upon for security purposes.
 ///
 /// # Panics
 ///
 /// The returned iterator will panic during iteration if any argument to the
-/// process is not valid unicode. If this is not desired it is recommended to
+/// process is not valid unicode. If this is not desired,
 /// use the `args_os` function instead.
 ///
 /// # Examples
@@ -543,7 +592,7 @@ pub fn args() -> Args {
 /// Returns the arguments which this program was started with (normally passed
 /// via the command line).
 ///
-/// The first element is traditionally the path to the executable, but it can be
+/// The first element is traditionally the path of the executable, but it can be
 /// set to arbitrary text, and it may not even exist, so this property should
 /// not be relied upon for security purposes.
 ///
@@ -576,6 +625,13 @@ impl ExactSizeIterator for Args {
     fn len(&self) -> usize { self.inner.len() }
 }
 
+#[stable(feature = "env_iterators", since = "1.11.0")]
+impl DoubleEndedIterator for Args {
+    fn next_back(&mut self) -> Option<String> {
+        self.inner.next_back().map(|s| s.into_string().unwrap())
+    }
+}
+
 #[stable(feature = "env", since = "1.0.0")]
 impl Iterator for ArgsOs {
     type Item = OsString;
@@ -588,16 +644,14 @@ impl ExactSizeIterator for ArgsOs {
     fn len(&self) -> usize { self.inner.len() }
 }
 
-/// Returns the page size of the current architecture in bytes.
-#[unstable(feature = "page_size", reason = "naming and/or location may change")]
-pub fn page_size() -> usize {
-    os_imp::page_size()
+#[stable(feature = "env_iterators", since = "1.11.0")]
+impl DoubleEndedIterator for ArgsOs {
+    fn next_back(&mut self) -> Option<OsString> { self.inner.next_back() }
 }
-
 /// Constants associated with the current target
 #[stable(feature = "env", since = "1.0.0")]
 pub mod consts {
-    /// A string describing the architecture of the CPU that this is currently
+    /// A string describing the architecture of the CPU that is currently
     /// in use.
     ///
     /// Some possible values:
@@ -607,12 +661,12 @@ pub mod consts {
     /// - arm
     /// - aarch64
     /// - mips
-    /// - mipsel
     /// - powerpc
+    /// - powerpc64
     #[stable(feature = "env", since = "1.0.0")]
     pub const ARCH: &'static str = super::arch::ARCH;
 
-    /// The family of the operating system. In this case, `unix`.
+    /// The family of the operating system. Example value is `unix`.
     ///
     /// Some possible values:
     ///
@@ -621,8 +675,8 @@ pub mod consts {
     #[stable(feature = "env", since = "1.0.0")]
     pub const FAMILY: &'static str = super::os::FAMILY;
 
-    /// A string describing the specific operating system in use: in this
-    /// case, `linux`.
+    /// A string describing the specific operating system in use.
+    /// Example value is `linux`.
     ///
     /// Some possible values:
     ///
@@ -634,13 +688,14 @@ pub mod consts {
     /// - bitrig
     /// - netbsd
     /// - openbsd
+    /// - solaris
     /// - android
     /// - windows
     #[stable(feature = "env", since = "1.0.0")]
     pub const OS: &'static str = super::os::OS;
 
     /// Specifies the filename prefix used for shared libraries on this
-    /// platform: in this case, `lib`.
+    /// platform. Example value is `lib`.
     ///
     /// Some possible values:
     ///
@@ -650,7 +705,7 @@ pub mod consts {
     pub const DLL_PREFIX: &'static str = super::os::DLL_PREFIX;
 
     /// Specifies the filename suffix used for shared libraries on this
-    /// platform: in this case, `.so`.
+    /// platform. Example value is `.so`.
     ///
     /// Some possible values:
     ///
@@ -661,28 +716,30 @@ pub mod consts {
     pub const DLL_SUFFIX: &'static str = super::os::DLL_SUFFIX;
 
     /// Specifies the file extension used for shared libraries on this
-    /// platform that goes after the dot: in this case, `so`.
+    /// platform that goes after the dot. Example value is `so`.
     ///
     /// Some possible values:
     ///
-    /// - .so
-    /// - .dylib
-    /// - .dll
+    /// - so
+    /// - dylib
+    /// - dll
     #[stable(feature = "env", since = "1.0.0")]
     pub const DLL_EXTENSION: &'static str = super::os::DLL_EXTENSION;
 
     /// Specifies the filename suffix used for executable binaries on this
-    /// platform: in this case, the empty string.
+    /// platform. Example value is `.exe`.
     ///
     /// Some possible values:
     ///
-    /// - exe
+    /// - .exe
+    /// - .nexe
+    /// - .pexe
     /// - `""` (an empty string)
     #[stable(feature = "env", since = "1.0.0")]
     pub const EXE_SUFFIX: &'static str = super::os::EXE_SUFFIX;
 
     /// Specifies the file extension, if any, used for executable binaries
-    /// on this platform: in this case, the empty string.
+    /// on this platform. Example value is `exe`.
     ///
     /// Some possible values:
     ///
@@ -792,6 +849,17 @@ mod os {
     pub const EXE_EXTENSION: &'static str = "";
 }
 
+#[cfg(target_os = "solaris")]
+mod os {
+    pub const FAMILY: &'static str = "unix";
+    pub const OS: &'static str = "solaris";
+    pub const DLL_PREFIX: &'static str = "lib";
+    pub const DLL_SUFFIX: &'static str = ".so";
+    pub const DLL_EXTENSION: &'static str = "so";
+    pub const EXE_SUFFIX: &'static str = "";
+    pub const EXE_EXTENSION: &'static str = "";
+}
+
 #[cfg(target_os = "windows")]
 mod os {
     pub const FAMILY: &'static str = "windows";
@@ -801,6 +869,38 @@ mod os {
     pub const DLL_EXTENSION: &'static str = "dll";
     pub const EXE_SUFFIX: &'static str = ".exe";
     pub const EXE_EXTENSION: &'static str = "exe";
+}
+
+#[cfg(all(target_os = "nacl", not(target_arch = "le32")))]
+mod os {
+    pub const FAMILY: &'static str = "unix";
+    pub const OS: &'static str = "nacl";
+    pub const DLL_PREFIX: &'static str = "lib";
+    pub const DLL_SUFFIX: &'static str = ".so";
+    pub const DLL_EXTENSION: &'static str = "so";
+    pub const EXE_SUFFIX: &'static str = ".nexe";
+    pub const EXE_EXTENSION: &'static str = "nexe";
+}
+#[cfg(all(target_os = "nacl", target_arch = "le32"))]
+mod os {
+    pub const FAMILY: &'static str = "unix";
+    pub const OS: &'static str = "pnacl";
+    pub const DLL_PREFIX: &'static str = "lib";
+    pub const DLL_SUFFIX: &'static str = ".pso";
+    pub const DLL_EXTENSION: &'static str = "pso";
+    pub const EXE_SUFFIX: &'static str = ".pexe";
+    pub const EXE_EXTENSION: &'static str = "pexe";
+}
+
+#[cfg(target_os = "emscripten")]
+mod os {
+    pub const FAMILY: &'static str = "unix";
+    pub const OS: &'static str = "emscripten";
+    pub const DLL_PREFIX: &'static str = "lib";
+    pub const DLL_SUFFIX: &'static str = ".so";
+    pub const DLL_EXTENSION: &'static str = "so";
+    pub const EXE_SUFFIX: &'static str = ".js";
+    pub const EXE_EXTENSION: &'static str = "js";
 }
 
 #[cfg(target_arch = "x86")]
@@ -828,14 +928,24 @@ mod arch {
     pub const ARCH: &'static str = "mips";
 }
 
-#[cfg(target_arch = "mipsel")]
-mod arch {
-    pub const ARCH: &'static str = "mipsel";
-}
-
 #[cfg(target_arch = "powerpc")]
 mod arch {
     pub const ARCH: &'static str = "powerpc";
+}
+
+#[cfg(target_arch = "powerpc64")]
+mod arch {
+    pub const ARCH: &'static str = "powerpc64";
+}
+
+#[cfg(target_arch = "le32")]
+mod arch {
+    pub const ARCH: &'static str = "le32";
+}
+
+#[cfg(target_arch = "asmjs")]
+mod arch {
+    pub const ARCH: &'static str = "asmjs";
 }
 
 #[cfg(test)]
